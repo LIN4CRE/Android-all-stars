@@ -1,0 +1,163 @@
+# =============================================================================
+# SMAS Mobile - repository ignore rules
+#
+# This repository is PUBLIC. It must never contain game data, save data,
+# signing material or credentials. `tools/repo_guard.py` enforces the same
+# rules in CI (and can be run locally before every push).
+# =============================================================================
+
+# --- Game files (ROMs) and other copyrighted game data: NEVER commit --------
+*.sfc
+*.smc
+*.swc
+*.fig
+*.bs
+*.st
+*.gd3
+*.gd7
+*.ufo
+*.078
+*.rom
+*.nes
+*.fds
+*.gb
+*.gbc
+*.gba
+*.n64
+*.z64
+*.v64
+*.iso
+*.bps
+*.ips
+*.ups
+*.xdelta
+*.pcm
+*.msu
+roms/
+rom/
+games/
+msu/
+covers/
+
+# --- Archives (commonly used to smuggle the above) ---------------------------
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+*.tar.xz
+*.tar.bz2
+# (the one archive the build needs is the Gradle wrapper jar, re-allowed below)
+
+# --- Save data, save states, backups -----------------------------------------
+*.srm
+*.sav
+*.sst
+*.state
+*.st[0-9]
+*.ss[0-9]
+*.pads
+*.smasbackup
+saves/
+states/
+backups/
+screenshots/
+smas_port.ini
+smas_port.log
+achievements.ini
+rompath.txt
+session.txt
+
+# --- Signing keys, passwords, credentials: NEVER commit ----------------------
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.pk8
+*.der
+*.crt
+*.cer
+*.asc
+*.gpg
+keystore.properties
+signing.properties
+secrets.properties
+release-signing.*
+*.b64
+.env
+.env.*
+!.env.example
+.netrc
+.git-credentials
+id_rsa*
+id_ed25519*
+google-services.json
+service-account*.json
+
+# --- Android / Gradle build outputs ------------------------------------------
+.gradle/
+**/build/
+build_*/
+out/
+dist/
+android/app/.cxx/
+android/.kotlin/
+**/.cxx/
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.idsig
+captures/
+.externalNativeBuild/
+lint-results*.xml
+lint-results*.html
+
+# --- Native / host build outputs ---------------------------------------------
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+*.pdb
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Testing/
+
+# --- Third-party sources fetched at build time (never vendored) --------------
+third_party/SDL2-*/
+
+# --- IDE / editor / OS noise --------------------------------------------------
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+node_modules/
+
+# --- Logs and crash dumps -----------------------------------------------------
+*.log
+hs_err_pid*
+*.hprof
+*.trace
+bugreport*.zip
+
+# --- Explicit re-includes ------------------------------------------------------
+!android/gradle/wrapper/gradle-wrapper.jar

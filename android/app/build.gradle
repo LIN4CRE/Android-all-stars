@@ -1,0 +1,71 @@
+plugins {
+    id 'com.android.application'
+}
+
+// release signing: android/keystore.properties + its keystore (kept out of the repository)
+def keystoreProps = new Properties()
+def keystoreFile = rootProject.file('keystore.properties')
+if (keystoreFile.exists()) keystoreFile.withInputStream { keystoreProps.load(it) }
+
+android {
+    namespace 'com.darhkfox.allstars'
+    compileSdk 34
+    ndkVersion '28.2.13676358'
+
+    defaultConfig {
+        applicationId 'com.darhkfox.allstars'
+        minSdk 23
+        targetSdk 34
+        versionCode 3
+        versionName '1.1.1'
+        ndk {
+            // phones (64-bit ARM) and the x86_64 emulator
+            abiFilters 'arm64-v8a', 'x86_64'
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.31.6'
+        }
+    }
+
+    sourceSets {
+        main {
+            // SDL's Java side (SDLActivity and friends) straight from its source
+            java.srcDirs = ['src/main/java', '../../third_party/SDL2-2.32.10-src/android-project/app/src/main/java']
+            // the launcher title's font (Luckiest Guy, Apache 2.0) and its licence
+            assets.srcDirs = ['../../third_party/fonts']
+        }
+    }
+
+    signingConfigs {
+        if (keystoreFile.exists()) {
+            release {
+                storeFile rootProject.file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // (without the release keystore: the debug key, as the debug builds, so it
+            // installs and updates over them; the native code optimised either way)
+            signingConfig keystoreFile.exists() ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError false
+    }
+}
