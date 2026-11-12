@@ -50,7 +50,7 @@ struct MenuPage {
   std::string subtitle;
   std::vector<MenuItem> items;
   int sel = 0;
-  float scroll = 0;  // first row shown (eases towards the selection)
+  float scroll = 0;  // pixels the list is scrolled by (eases towards the selection)
   bool freeScroll = false;  // (touch: dragged, so it doesn't follow the selection)
   bool wide = false;  // a wider panel (long lists, side panels)
   std::function<void(MenuPage&)> rebuild;  // called on enter / refresh
@@ -75,14 +75,57 @@ public:
   void refresh();
   // A Yes / No page (No selected) over the current one.
   void confirm(const std::string& question, std::function<void()> yes, const std::string& detail = "");
+  // A paragraph as lines that fit a page's rows (a wide page's when `wide`):
+  // for pages of explanation (Help, About, why a file was not accepted).
+  std::vector<std::string> wrapText(const std::string& text, bool wide = false) const;
+  // ... added to a page as read-only rows.
+  void addText(MenuPage& page, const std::string& text) const;
+  // For a page of text with a few actions: it opens at its top (not at its
+  // first action), and up and down scroll it, moving onto an action once that
+  // is in view. (Dragging scrolls any page.)
+  static void makeScrollable(MenuPage& page);
 
   // Rebinding capture state (set by the app)
   bool capturing = false;
 
   // Touch screens: a close button on the panel, and taps and drags on its rows.
   bool touchUi = false;
-  std::wstring keysHint;  // the footer's key line (empty: the keyboard and pad's)
+  // The footer's line of keys: shown while keys or a controller are in use
+  // (not while fingers are: the rows and the close button speak for themselves).
+  bool showKeys = true;
+  std::wstring keysHint;  // (another text for it; empty: the keyboard and pad's)
   bool confirmRight = false;  // (the pad's right face button confirms: the footer says so)
+  // How the menus are sized for the screen in hand (set by the app from the
+  // display's density). textScale: 1 is the size for a monitor or a TV, where
+  // the screen's height is the measure of everything; a phone's small screen
+  // needs larger text (about 1.5). minRow: the least height, in pixels, of a
+  // row that can be chosen, so that a finger can hit it (0: the text's own).
+  float textScale = 1.0f;
+  float minRow = 0;
+  // The part of the screen clear of a display cutout and rounded corners: the
+  // insets at the left, top, right and bottom, in pixels. Panels, toasts and
+  // the on-screen notes keep inside it.
+  void setSafeArea(float left, float top, float right, float bottom);
+  // The panel and the list as laid out for a screen (also used by the tests).
+  struct Metrics {
+    float s = 1;         // pixels per design unit: 1 on a 1080-line screen, times the text scale
+    float titleScale = 1;  // ... for titles (they grow less)
+    RectF safe{};        // the screen inside the insets
+    RectF panel{};
+    float pad = 0;       // the panel's inner margin
+    float sizeBody = 0, sizeSmall = 0, sizeHelp = 0;
+    float rowText = 0;   // the height of a line of text or a heading
+    float rowTouch = 0;  // the height of a row that can be chosen
+  };
+  Metrics metrics(int w, int h, bool wide) const;
+  // Where the last draw put the rows that can be tapped, and the close button (tests).
+  struct RowHit {
+    RectF r;
+    int index;
+  };
+  const std::vector<RowHit>& rowHits() const { return rowHits_; }
+  RectF closeHit() const { return closeHit_; }
+  RectF listRect() const { return listRect_; }
   void tap(float x, float y);
   void drag(float dy);
   std::string captureText;
@@ -138,6 +181,12 @@ private:
   int gameArt_ = 0;
   std::vector<std::shared_ptr<MenuPage>> stack_;
   float scale_ = 1.0f;
+  int lastW_ = 0, lastH_ = 0;  // (the screen as last drawn: wrapText)
+  float safe_[4] = {0, 0, 0, 0};
+  float rowText_ = 34, rowTouch_ = 34;  // (the rows' heights when last drawn)
+  RectF listRect_{};                    // (where the list was)
+  float rowHeight(const MenuItem& it) const;
+  std::vector<float> rowTops(const MenuPage& p) const;  // each row's top from the list's start, and the end
   float time_ = 0;  // for the selection's pulse
   ColorF accent_ = {0.91f, 0.72f, 0.29f, 1.0f};
   // key repeat
@@ -166,11 +215,6 @@ private:
   bool selectable(const MenuItem& it) const;
   void moveSel(int dir);
   // (where the last draw put each row, the close button)
-  struct RowHit {
-    RectF r;
-    int index;
-  };
   std::vector<RowHit> rowHits_;
   RectF closeHit_{};
-  float rowH_ = 1;
 };

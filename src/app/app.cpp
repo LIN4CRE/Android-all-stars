@@ -1,5 +1,5 @@
-// Super Mario All-Stars port: the application, the same on every platform
-// (see app.h).
+// SMAS Mobile: the frame loop, input, layout, and the in-game and settings
+// menus (see app.h).
 #include "app/app.h"
 #include <algorithm>
 #include <chrono>
@@ -8,20 +8,33 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <filesystem>
 #include "app/achexport.h"
 #include "app/msupack.h"
+#include "app/platform.h"
 #include "app/sys.h"
 #include "app/vkeys.h"
 #include "core/fileio.h"
 #include "core/png.h"
 
-const wchar_t* kAppTitle = L"Super Mario All-Stars";
-const char* kAppVersion = "1.1.1";
-namespace {
-const char* kExpectedTitle = "SUPER MARIO ALL_STARS";
-constexpr uint32_t kKnownCrc = 0x925637c7;  // Super Mario All-Stars (USA)
-}  // namespace
+#ifndef SMAS_VERSION_NAME
+#define SMAS_VERSION_NAME "0.0.0-dev"
+#endif
+
+const wchar_t* kAppTitle = L"SMAS Mobile";
+const wchar_t kLogFileName[] = L"smas-mobile.log";
+const char* kAppName = "SMAS Mobile";
+const char* kAppVersion = SMAS_VERSION_NAME;
+const char* kPublisher = "LIN4CRE";
+const char* kUpstreamVersion = "1.1.1";
+const char* kSourceUrl = "https://github.com/LIN4CRE/Android-all-stars";
+const char* kReleasesUrl = "https://github.com/LIN4CRE/Android-all-stars/releases";
+const char* kUpstreamUrl = "https://github.com/Darhkfox/SuperMarioAllStars";
+
+uint32_t appVersionNumber() {
+  int a = 0, b = 0, c = 0;
+  sscanf(kAppVersion, "%d.%d.%d", &a, &b, &c);
+  return (uint32_t)(std::clamp(a, 0, 999) * 10000 + std::clamp(b, 0, 99) * 100 + std::clamp(c, 0, 99));
+}
 
 App* g_app = nullptr;
 FILE* g_log = nullptr;  // (opened by the platform)
@@ -30,6 +43,7 @@ void logf(const char* fmt, ...) {
   if (!g_log) return;
   va_list ap;
   va_start(ap, fmt);
+  fputs(timeText("%H:%M:%S ").c_str(), g_log);
   vfprintf(g_log, fmt, ap);
   va_end(ap);
   fputc('\n', g_log);
@@ -41,342 +55,6 @@ std::string narrow(const std::wstring& w) { return narrowUtf8(w); }
 bool readAll(const std::wstring& path, std::vector<uint8_t>& out) { return readFile(path, out, 16u << 20); }
 
 bool writeAll(const std::wstring& path, const void* d, size_t n) { return writeFileSafely(path, d, n); }
-
-static uint32_t crc32(const uint8_t* d, size_t n) {
-  static uint32_t table[256];
-  static bool init = false;
-  if (!init) {
-    for (uint32_t i = 0; i < 256; i++) {
-      uint32_t v = i;
-      for (int k = 0; k < 8; k++) v = (v & 1) ? 0xedb88320u ^ (v >> 1) : v >> 1;
-      table[i] = v;
-    }
-    init = true;
-  }
-  uint32_t c = 0xffffffffu;
-  for (size_t i = 0; i < n; i++) c = table[(c ^ d[i]) & 0xff] ^ (c >> 8);
-  return ~c;
-}
-
-// Validate that the data is the Super Mario All-Stars ROM (headered or not).
-bool isSmasRom(const std::vector<uint8_t>& d, bool* exact) {
-  size_t off = (d.size() & 0x3ff) == 0x200 ? 0x200 : 0;
-  if (d.size() < off + 0x8000) return false;
-  const uint8_t* h = d.data() + off + 0x7fc0;
-  if (memcmp(h, kExpectedTitle, strlen(kExpectedTitle)) != 0) return false;
-  if (exact) *exact = (d.size() - off == 0x200000) && crc32(d.data() + off, d.size() - off) == kKnownCrc;
-  return true;
-}
-
-bool App::loadRom() {
-  std::wstring path;
-  // remembered location
-  std::string rp;
-  if (readText(pathJoin(exeDir, L"rompath.txt"), rp)) {
-    while (!rp.empty() && (rp.back() == '\n' || rp.back() == '\r')) rp.pop_back();
-    std::wstring w = widenUtf8(rp);
-    std::vector<uint8_t> data;
-    if (readAll(w, data) && isSmasRom(data, nullptr)) path = w;
-  }
-  // (Not found: the launcher's cards say what is needed, and it is looked for
-  // again while they are shown.)
-  if (path.empty() && !findRom(&path)) return false;
-  std::vector<uint8_t> data;
-  bool exact = false;
-  if (!readAll(path, data) || !isSmasRom(data, &exact)) return false;
-  // (Another version or dump than the USA one: it runs, the card's ROM line in
-  // amber; widescreen, cheats and the level select are tuned for the USA one.)
-  const std::string remembered = narrow(path) + "\n";
-  writeAll(pathJoin(exeDir, L"rompath.txt"), remembered.data(), remembered.size());
-  romPath = path;
-  romExact = exact;
-  game.reset();  // (before the Snes it points at: its destructor uses it)
-  snes = std::make_unique<Snes>();
-  // (the console's copy patched for an MSU-1 pack if one is chosen; the
-  // launcher's previews run the ROM as it is)
-  std::vector<uint8_t> run = data;
-  applyMsu(run);
-  if (!snes->loadRom(run)) {
-    snes.reset();
-    return false;
-  }
-  romData = std::move(data);
-  game = std::make_unique<SmasGame>(*snes);
-  game->install();
-  snes->reset(true);
-  loadSram();
-  return true;
-}
-
-// The chosen MSU-1 pack (see app/msupack.h): its patch applied to the
-// console's ROM and the chip attached, or why not (msuStatus).
-void App::applyMsu(std::vector<uint8_t>& rom) {
-  if (msuDir.empty()) msuDir = pathJoin(exeDir, L"msu");
-  makeDir(msuDir);
-  msuLoaded = cfg.msuPack;
-  msuStatus.clear();
-  msuBase.clear();
-  if (cfg.msuPack.empty()) return;
-  MsuPack pk;
-  std::string err;
-  std::vector<uint8_t> patch;
-  if (findMsuPack(msuDir, cfg.msuPack, pk, &err)) {
-    if (!readFile(pk.patch, patch, 16u << 20)) {
-      err = "its patch can't be read";
-    } else {
-      std::vector<uint8_t> patched = rom;
-      if ((patched.size() & 0x3ff) == 0x200) patched.erase(patched.begin(), patched.begin() + 0x200);
-      if (applyRomPatch(patch, patched, &err)) {
-        rom.swap(patched);
-        snes->msu = std::make_unique<Msu1>();
-        snes->msu->open(pk.base);
-        snes->msu->setGain(cfg.msuVolume / 100.0f * cfg.musicVolume / 100.0f);
-        msuBase = pk.base;
-        msuStatus = "Playing " + narrow(cfg.msuPack) + ": " + std::to_string(pk.tracks) + " tracks, patched with " +
-                    narrow(pathName(pk.patch)) + ".";
-        logf("MSU-1 pack %s: %d tracks, patch %s", narrow(cfg.msuPack).c_str(), pk.tracks,
-             narrow(pk.patch).c_str());
-        return;
-      }
-    }
-  }
-  msuStatus = "Not used: " + err + ".";
-  logf("MSU-1 pack %s not used: %s", narrow(cfg.msuPack).c_str(), err.c_str());
-}
-
-// Another pack chosen: the console is rebuilt with it (outside a game: the
-// launcher shows). Save files are kept; a game's save states belong with the
-// pack they were made with.
-void App::reloadForMsu() {
-  if (!snes || cfg.msuPack == msuLoaded) return;
-  saveSram();
-  if (loadRom()) romReady();
-}
-
-// Updates: once a day (or on Check Now) the latest release's tag is looked up
-// in the background; newer than this version, the launcher shows a badge
-// (and Options a "Get Version" button) that opens its page.
-void App::checkForUpdate(bool manual) {
-  if (test.on || test.runSeconds > 0) return;
-#ifdef _WIN32
-  if (at.on) {  // (the recording mode: no network, only what an earlier check found)
-    applyUpdateTag(cfg.checkUpdates ? cfg.updateLatest : std::string());
-    return;
-  }
-#endif
-  if (!manual && !cfg.checkUpdates) return;
-  const std::string today = timeText("%Y-%m-%d");
-  if (!manual && cfg.updateCheckedOn == today) {
-    applyUpdateTag(cfg.updateLatest);  // (checked today already)
-    return;
-  }
-  updateManual = manual;
-  updater.start();
-}
-
-void App::applyUpdateTag(const std::string& tag) {
-  const bool newer = !tag.empty() && UpdateCheck::isNewer(tag, kAppVersion);
-  updateTag = newer && (cfg.checkUpdates || updateManual) ? tag : std::string();
-  launcher.setUpdate(updateTag);
-  if (!updateTag.empty() && !updateTold) {
-    updateTold = true;
-    menu.notify("Version " + updateVersion() + " is available - select the badge, or Options > Get Version " +
-                    updateVersion(),
-                6.0f);
-  }
-}
-
-void App::updateTick() {
-  if (!updateStarted) {
-    updateStarted = true;
-    checkForUpdate(false);
-  }
-  std::string tag;
-  if (!updater.poll(&tag)) return;
-  const bool manual = updateManual;
-  if (!tag.empty()) {
-    cfg.updateCheckedOn = timeText("%Y-%m-%d");
-    cfg.updateLatest = tag;
-    if (!test.on && test.runSeconds <= 0) cfg.save(configPath);
-    if (manual) updateTold = false;
-    applyUpdateTag(tag);
-    if (manual && updateTag.empty()) menu.notify(std::string("You have the latest version (") + kAppVersion + ")", 4.0f);
-  } else if (manual) {
-    menu.notify("Couldn't reach GitHub to check for updates", 4.0f);
-  }
-  updateManual = false;
-  if (menu.open()) menu.refresh();
-}
-
-// After the ROM is loaded (at start, or found later while the launcher shows).
-void App::romReady() {
-  music.init(snes.get(), game.get(), &audio);
-  music.setMsu(msuBase, narrow(msuLoaded), cfg.msuVolume / 100.0f);  // (the Music Player plays the pack too)
-  achNewRun(cfg.achievements);
-  applyConfig();
-  if (!test.on && test.runSeconds <= 0)
-    launcher.setRom(&romData, narrow(romPath.substr(romPath.find_last_of(L"\\/") + 1)), romExact, snes->sram,
-                    sizeof(snes->sram));
-  if (!romExact) logf("ROM is not the USA dump (CRC differs): running it anyway");
-}
-
-void App::pollRom(double dt) {
-  if (snes || (romPoll -= dt) > 0) return;
-  romPoll = 1.0;
-  if (!loadRom()) return;
-  logf("rom found: %s", narrow(romPath).c_str());
-  romReady();
-  menu.notify("Super Mario All-Stars ROM found");
-}
-
-// A card chosen (or Reset Game): the console is reset and driven through the
-// All-Stars menu to the game's save files, out of sight (see
-// SmasGame::requestTitle), as a new run for achievements.
-void App::launchGame(GameId g) {
-  pendingSave = -1;  // (a save waiting for a co-op turn's end: not into another game)
-  if (!snes) {
-#ifdef _WIN32
-    menu.notify("ROM not found - see the game cards");
-#else
-    pickRom();
-#endif
-    return;
-  }
-  reloadForMsu();  // (a pack chosen in a game: in use from this start)
-  if (!snes) return;
-  playing = g;
-  for (int i = 0; i < Launcher::kCards; i++)
-    if (Launcher::cardGame(i) == g) cfg.lastGame = i;
-  launcher.selectGame(g);
-  launcher.stopSound();
-  inLauncher = false;
-  menu.closeAll();
-  if (rewinding) endRewind();
-  if (g == GameId::Menu) {
-    // (the All-Stars card: the cartridge as at power-on, its title and game select)
-    saveSram();
-    game->cancelWarps();
-    snes->reset(false);
-  } else {
-    game->requestTitle(g, false);
-  }
-  rewind.clear();
-  audio.flush();
-  achNewRun(cfg.achievements);
-  applyConfig();
-  if (!test.on && test.runSeconds <= 0) cfg.save(configPath);
-#ifdef _WIN32
-  if (at.on) menuHintShown = true;  // (the recording mode: no hint over the footage)
-#endif
-  if (!menuHintShown && !test.on) {
-    menuHintShown = true;
-    menu.notify(cfg.selectMode == 0 ? "Press Select or Esc for the menu" : "Hold Select or press Esc for the menu", 4.0f,
-                true);
-  }
-}
-
-void App::returnToLauncher() {
-  pendingSave = -1;
-  if (rewinding) endRewind();
-  saveSram();
-  game->cancelWarps();
-  rewind.clear();
-  audio.flush();
-  menu.closeAll();
-  launcher.selectGame(playing);
-  inLauncher = true;
-  reloadForMsu();
-}
-
-// A display refresh on the launcher: its cards and buttons (or a menu page
-// over it), the previews' frames.
-void App::frameLauncher(double dt, int gameFrames) {
-  pollRom(dt);
-  const bool menuOpen = menu.open();
-  MenuInput mi = menuInput();
-  if (menuOpen) {
-    if (menu.top() && !menu.capturing) menu.update(mi, (float)dt);
-    menuAnim = std::min(1.0f, menuAnim + (float)dt * 8.0f);
-  } else {
-    auto push = [&](std::shared_ptr<MenuPage> p) {
-      menuAnim = 0;
-      menu.push(p);
-    };
-    Launcher::Action act = launcher.update(mi, (float)dt);
-    if (act == Launcher::kNone) act = launcherTap;  // (a tap, or a click)
-    launcherTap = Launcher::kNone;
-    switch (act) {
-      case Launcher::kPlay: launchGame(Launcher::cardGame(launcher.card())); return;
-      case Launcher::kOptions: push(pageOptions()); break;
-      case Launcher::kAchievements: push(pageAchievements()); break;
-      case Launcher::kMusic:
-        if (snes) push(pageMusicPlayer());
-        else menu.notify("ROM not found - see the game cards");
-        break;
-      case Launcher::kCredits: push(pageCredits()); break;
-      case Launcher::kUpdate:
-        if (!updateTag.empty()) {
-          openUrl(UpdateCheck::pageFor(updateTag).c_str());
-          menu.notify("Opened the version " + updateVersion() + " download page in your browser");
-        }
-        break;
-      case Launcher::kPatreon:
-        openUrl("https://www.patreon.com/TeamRedTail");
-        menu.notify("Opened Patreon in your browser");
-        break;
-      case Launcher::kQuit:
-        if (mi.back) {
-          menuAnim = 0;
-          menu.confirm("Quit?", [this]() { running = false; });
-        } else {
-          running = false;
-        }
-        break;
-      default: break;
-    }
-  }
-  if (menuOpen && !menu.open()) cfg.save(configPath);
-  if (snes) music.update(dt, menu.open());
-  // (the chosen card's sound, not under a menu page: the music player's there)
-  launcher.runPreviews(gameFrames, !menu.open() && !(cfg.muteUnfocused && !focused), audio, pacing.hz);
-}
-
-// Black frame insertion's state, beside its switch.
-int App::hfrSubFrames() const {
-  if (!cfg.highFrameRate || cfg.blackFrames || pacing.hz < 89) return 1;
-  return std::clamp((int)std::lround(pacing.hz / Snes::kFrameRate + 0.25), 2, Ppu::kMaxSubFrames);
-}
-
-std::string App::blackFramesNote() const {
-  if (!cfg.blackFrames) return "";
-  if (!cfg.vsync) return "needs VSync";
-  char buf[48];
-  if (pacing.perFrame >= 2) snprintf(buf, sizeof buf, "%.0f Hz", pacing.hz);
-  else snprintf(buf, sizeof buf, "needs 120 Hz (now %.0f)", pacing.hz);
-  return buf;
-}
-
-void App::loadSram() {
-  std::vector<uint8_t> d;
-  if (readAll(pathJoin(saveDir, L"smas.srm"), d) && d.size() >= sizeof(snes->sram)) {
-    memcpy(snes->sram, d.data(), sizeof(snes->sram));
-  }
-  snes->sramDirty = false;
-}
-
-void App::saveSram() {
-  if (!snes) return;
-  if (writeAll(pathJoin(saveDir, L"smas.srm"), snes->sram, sizeof(snes->sram))) {
-    snes->sramDirty = false;
-    sramFailed = false;
-  } else if (!sramFailed) {  // (still dirty: tried again later)
-    sramFailed = true;
-    logf("saving game progress failed");
-    menu.notify("Could not save game progress (is the disk full?)");
-  }
-}
-
-std::wstring App::statePath(int slot) const { return pathJoin(saveDir, L"state" + std::to_wstring(slot) + L".sst"); }
 
 // A rewind snapshot back in the machine. Battery saves are kept as they are
 // now: rewinding never takes back progress the game has saved.
@@ -422,73 +100,29 @@ void App::endRewind() {
   audio.flush();
 }
 
-void App::saveState(int slot) {
-  // (In a co-op turn's middle the other player's variables are the game's:
-  // saved there, the game's player came back as him. At the next frame's end.)
-  if (game->coopMidTurn()) {
-    pendingSave = slot;
-    return;
-  }
-  pendingSave = -1;
-  auto st = snes->saveState();
-  if (writeAll(statePath(slot), st.data(), st.size())) menu.notify("State " + std::to_string(slot) + " saved");
-  else menu.notify("Could not save state " + std::to_string(slot) + " (is the disk full?)");
-}
-
-void App::loadState(int slot) {
-  pendingSave = -1;  // (the timeline it was asked in is gone)
-  std::vector<uint8_t> d;
-  if (!readAll(statePath(slot), d)) {
-    menu.notify("State " + std::to_string(slot) + " is empty");
-    return;
-  }
-  if (snes->loadState(d)) {
-    game->onStateLoaded();
-    rewind.clear();  // (the past belongs to another timeline now)
-    // The state says whether its run counted for achievements.
-    AchievementTracker& t = game->achievements();
-    if (!cfg.achievements) t.counts = false;
-    menu.notify("State " + std::to_string(slot) + " loaded");
-    if (cfg.achievements && !t.counts)
-      menu.notify("This state was saved while achievements weren't counting: they count again after "
-                  "Reset Game", 5.0f);
-    audio.flush();
-  } else {
-    menu.notify("State " + std::to_string(slot) + " is not compatible");
-  }
-}
-
 void App::screenshot() {
   makeDir(shotDir);
   const std::wstring name = widenUtf8(timeText("smas_%Y%m%d_%H%M%S.png"));
   int eL = snes->ppu.extL, eR = snes->ppu.extR;
   bool ok = writePng(narrow(pathJoin(shotDir, name)), snes->ppu.frame + (kMaxExt - eL), 256 + eL + eR,
                      snes->ppu.frameHeight(), kLineW);
-  menu.notify(ok ? "Screenshot saved" : "Screenshot failed");
+  menu.notify(ok ? "Screenshot saved to the app's screenshots folder" : "Screenshot failed");
 }
 
 // ---------------------------------------------------------------------------
 // Display
 
 
-void App::applyLauncherArt(bool reload) {
-  launcher.setCoverFill(cfg.launcherCoverFill);
-  launcher.setArt(pathJoin(exeDir, L"covers"), cfg.launcherCovers, cfg.launcherBackground, reload);
-}
-
 void App::applyConfig() {
-  applyLauncherArt();
   audio.setVolume(cfg.volume / 100.0f);
   audio.setLatency(cfg.audioLatency);
   menu.confirmRight = cfg.confirmRight;
   menu.style = cfg.menuStyle;
-  launcher.setConfirmRight(cfg.confirmRight);
   if (snes) snes->ppu.noSpriteLimit = cfg.noSpriteLimit;
   if (snes) {
     snes->apu.dsp.musicGain = cfg.musicVolume * 256 / 100;
     snes->apu.dsp.sfxGain = cfg.sfxVolume * 256 / 100;
   }
-  launcher.setGains(cfg.musicVolume * 256 / 100, cfg.sfxVolume * 256 / 100);
   // (a music pack's songs are music too: its own volume, times the music's)
   if (snes && snes->msu) snes->msu->setGain(cfg.msuVolume / 100.0f * cfg.musicVolume / 100.0f);
   music.setMsuGain(cfg.msuVolume / 100.0f);
@@ -506,10 +140,16 @@ void App::applyConfig() {
 
 // Decide the widescreen margin and the destination rectangle.
 void App::computeLayout(IRect* dest, int* extOut, int* srcW) {
-  int W = video.width(), H = video.height();
+  // The picture keeps to the display's safe area (clear of a cutout).
+  const int insL = (int)insets[0], insT = (int)insets[1];
+  int W = video.width() - insL - (int)insets[2], H = video.height() - insT - (int)insets[3];
+  if (W < 16 || H < 16) W = video.width(), H = video.height();
   double par = cfg.pixelAspectCrt ? 8.0 / 7.0 : 1.0;
   double target;
-  switch (cfg.aspect) {
+  // With the on-screen controls in use, a 4:3 picture leaves the sides of a
+  // phone's wide screen for them: thumbs never cover the game.
+  const int aspect = touchShown() && cfg.touchPicture4x3 ? (int)kAspect4x3 : cfg.aspect;
+  switch (aspect) {
     case kAspect4x3: target = 0; break;
     case kAspect16x10: target = 16.0 / 10.0; break;
     case kAspect16x9: target = 16.0 / 9.0; break;
@@ -524,9 +164,6 @@ void App::computeLayout(IRect* dest, int* extOut, int* srcW) {
   }
   // A minimised window has a 1x1 client area: keep the last layout, or the
   // game would switch to 4:3 (and its widescreen patches off) meanwhile.
-#ifdef _WIN32
-  if (IsIconic(hwnd)) wantExt = lastWantExt;
-#endif
   if (W < 16 || H < 16) wantExt = lastWantExt;
   lastWantExt = wantExt;
   game->setWidescreen(wantExt);
@@ -567,7 +204,7 @@ void App::computeLayout(IRect* dest, int* extOut, int* srcW) {
     // chosen aspect matches (a stretch of under two pixels).
     if (target > 0 && extL + extR >= 2 * wantExt && dw < W && W - dw < 2 * par * s + 1) dw = W;
   }
-  int x0 = (int)std::lround((W - dw) / 2), y0 = (int)std::lround((H - dh) / 2);
+  int x0 = insL + (int)std::lround((W - dw) / 2), y0 = insT + (int)std::lround((H - dh) / 2);
   *dest = IRect{x0, y0, x0 + (int)std::lround(dw), y0 + (int)std::lround(dh)};
 }
 
@@ -650,37 +287,27 @@ void App::readPlayer(int p, uint16_t* out, double dt) {
   *out = v;
 
   if (p == 0) {
-    if (menuPressed && !menu.open() && !inLauncher) {
+    if (menuPressed && !menu.open() && !inHub && !editingTouch) {
       logf("menu opened by %s (select key=%d pad=%d, menu button=%d, pad %d)",
            select ? "Select" : "Menu button", (int)input.active(cfg.keys[p][kActSelect], padIdx, dz),
            (int)input.active(cfg.pad[p][kActSelect], padIdx, dz), (int)menuBtn, padIdx);
       openMenu();
     }
     auto edge = [&](int a) { return act[a] && !prevAction[p][a]; };
-    if (!menu.open() && !inLauncher) {
+    if (!menu.open() && !inHub && !editingTouch) {
       if (edge(kActSaveState)) saveState(stateSlot);
       if (edge(kActLoadState)) loadState(stateSlot);
       if (edge(kActScreenshot)) screenshot();
     }
-#ifndef __ANDROID__
-    if (!menu.open()) {
-      if (edge(kActFullscreen)) {
-        cfg.displayMode = cfg.displayMode == DisplayMode::Windowed ? DisplayMode::Borderless : DisplayMode::Windowed;
-        applyDisplayMode();
-      }
-    }
-#endif
     // (Not while the level select drives the game to the chosen level.)
-    const bool inGame = !inLauncher && game && !game->levelLoading();
-#ifndef _WIN32
+    const bool inGame = !inHub && !editingTouch && game && !game->levelLoading();
     act[kActRewind] |= touch.held(TouchControls::BtnRewind);
     act[kActFastForward] |= touch.held(TouchControls::BtnFF);
-#endif
     rewindHeld = cfg.rewind && !achLocked() && act[kActRewind] && !menu.open() && inGame;
     fastForward = cfg.fastForward && !achLocked() && act[kActFastForward] && !menu.open() && !rewindHeld && inGame;
     // (pressed while achievements keep them off: say so, or they just seemed broken)
     if (achLocked() && !menu.open() && inGame && (edge(kActRewind) || edge(kActFastForward)))
-      menu.notify("Fast forward and rewind are off while achievements are on (Options > Achievements)", 3.5f);
+      menu.notify("Fast forward and rewind are off while achievements are on (Settings > Achievements)", 3.5f);
   }
   for (int a = 0; a < kActCount; a++) prevAction[p][a] = act[a];
 }
@@ -737,20 +364,26 @@ void App::openMenu() {
   prevMenuNav[4] = prevMenuNav[5] = true;
 }
 
+// A page over the hub or another page.
+void App::pushPage(std::shared_ptr<MenuPage> p) {
+  if (!menu.open()) menuAnim = 0;
+  menu.push(std::move(p));
+}
+
 void App::updateInput(double dt) {
-#ifdef _WIN32
-  if (!at.on) input.poll();  // (the recording mode: the script's keys and pads only)
-#else
   input.poll();
-#endif
+  if (input.anyPadActivity()) touchActive = false;  // (a controller in use: the on-screen controls step aside)
   for (int p = 0; p < 2; p++) readPlayer(p, &padState[p], dt);
-#ifndef _WIN32
   touchFrame();
   padState[0] |= touch.takeSnesButtons();
-#endif
+  // A menu just closed (or the game was just entered): what is held now chose
+  // something in the menu, and is not the game's until it is let go.
+  const bool away = menu.open() || inHub || editingTouch;
+  if (menuWasOpen && !away)
+    for (int p = 0; p < 2; p++) padSwallow[p] = padState[p];
+  menuWasOpen = away;
   if (!snes) return;
-  snes->input[0] = menu.open() || inLauncher ? 0 : padState[0];
-  snes->input[1] = menu.open() || inLauncher ? 0 : padState[1];
+  for (int p = 0; p < 2; p++) snes->input[p] = away ? 0 : swallowHeld(padState[p], &padSwallow[p]);
 }
 
 // ---------------------------------------------------------------------------
@@ -769,7 +402,7 @@ void App::updateBind(double dt) {
   if (bindAction < 0) return;
   bindTimer -= dt;
   char buf[160];
-  snprintf(buf, sizeof buf, "Press a %s for \"%s\"  (Esc to cancel, Delete to clear)  %d",
+  snprintf(buf, sizeof buf, "Press a %s for \"%s\"  (Back cancels)  %d",
            bindPad ? "controller button" : "key", actionName(bindAction), (int)std::ceil(bindTimer));
   menu.captureText = buf;
   bool cancel = bindTimer <= 0;
@@ -798,7 +431,7 @@ std::shared_ptr<MenuPage> App::pageMain() {
   auto p = std::make_shared<MenuPage>();
   p->rebuild = [this](MenuPage& pg) {
     GameId g = game->current();
-    // (on the All-Stars file panel the launcher went to: the game being started)
+    // (on the All-Stars file panel the hub went to: the game being started)
     const bool inTitle = g == GameId::SMB1 || g == GameId::SMBLL || g == GameId::SMB2 || g == GameId::SMB3;
     pg.title = inTitle ? SmasGame::gameName(g)
                : playing == GameId::Menu ? "Super Mario All-Stars"
@@ -819,28 +452,29 @@ std::shared_ptr<MenuPage> App::pageMain() {
             " loads in game).");
     slot.valueText = [this]() {
       // the slot and when it was saved (or that it's empty)
-      std::string t = std::to_string(stateSlot) + "  \xE2\x80\xA2  ";
-      int day, month, hour, minute;
-      if (!fileModified(statePath(stateSlot), &day, &month, &hour, &minute)) return t + "Empty";
-      static const char* kMon[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-      char buf[48];
-      snprintf(buf, sizeof buf, "%d %s, %02d:%02d", day, kMon[(month + 11) % 12], hour, minute);
-      return t + buf;
+      return std::to_string(stateSlot) + "  \xE2\x80\xA2  " + slotText(stateSlot);
     };
     pg.items.push_back(slot);
     pg.items.push_back(MenuItem::action("Save State", [this]() {
       saveState(stateSlot);
       menu.closeAll();
-    }, "Save a snapshot of the game to the selected slot."));
+    }, "Save a snapshot of the game to the selected slot. What the slot held before is kept as its previous "
+       "version (Save Management)."));
     pg.items.push_back(MenuItem::action("Load State", [this]() {
-      if (!fileExists(statePath(stateSlot))) {
+      if (!states::slotUsed(saveDir, stateSlot)) {
         menu.notify("Slot " + std::to_string(stateSlot) + " is empty");
         return;
       }
       loadState(stateSlot);
       menu.closeAll();
-    }, "Restore the snapshot in the selected slot."));
+    }, "Go back to the snapshot in the selected slot. Progress the game itself has saved is never undone by "
+       "this, and Undo Load State takes you back to where you were."));
+    if (!undoState.empty()) {
+      pg.items.push_back(MenuItem::action("Undo Load State", [this]() {
+        undoLoadState();
+        menu.closeAll();
+      }, "Back to the moment before you loaded state " + std::to_string(undoSlot) + "."));
+    }
 
     pg.items.push_back(MenuItem::header("Game"));
     // with achievements on, the level select and cheats are greyed out (Options turns achievements off)
@@ -867,34 +501,26 @@ std::shared_ptr<MenuPage> App::pageMain() {
                                          "Classic sound test: play any music number and sound effect."));
     pg.items.push_back(MenuItem::submenu("Music Player", [this]() { menu.push(pageMusicPlayer()); },
                                          "Browse and listen to the soundtrack of all four games."));
-    pg.items.push_back(MenuItem::submenu("Options", [this]() { menu.push(pageOptions()); },
+    pg.items.push_back(MenuItem::submenu("Settings", [this]() { menu.push(pageOptions()); },
                                          "Display, graphics, colour, audio, controls, speed and achievements."));
-    pg.items.push_back(MenuItem::submenu("Credits", [this]() { menu.push(pageCredits()); },
-                                         "Who made this port, and where to find them."));
+    pg.items.push_back(MenuItem::submenu("Help", [this]() { menu.push(pageHelp()); },
+                                         "How saving works, the controls, and what to do when something is wrong."));
 
     pg.items.push_back(MenuItem::header("System"));
     pg.items.push_back(MenuItem::action("Take Screenshot", [this]() { screenshot(); },
-                                        "Saves the game picture (without the menu) to the screenshots folder (" +
-                                            bindingsText(kActScreenshot) + " in game)."));
+                                        "Saves the game picture (without the menu) to the app's screenshots folder."));
     pg.items.push_back(MenuItem::action("Reset Game", [this]() {
       menu.confirm("Reset the game?", [this]() {
         menu.closeAll();
         launchGame(playing);
-      }, "Back to its save files. Progress is kept only if the game saved it.");
+      }, "Back to its save files. Progress since the game last saved is lost (a save state keeps it).");
     }, "Start this game again from its save files, as at power-on."));
-    pg.items.push_back(MenuItem::action("Return to Launcher", [this]() {
-      menu.confirm("Return to the launcher?", [this]() { returnToLauncher(); },
-                   "Progress is kept only if the game saved it.");
-    }, "Leave this game for the launcher, to pick another."));
-#ifdef _WIN32
-    pg.items.push_back(MenuItem::action("Quit to Desktop", [this]() {
-      menu.confirm("Quit to desktop?", [this]() { running = false; },
-#else
-    pg.items.push_back(MenuItem::action("Quit", [this]() {
-      menu.confirm("Quit?", [this]() { running = false; },
-#endif
-                   "Progress is kept only if the game saved it.");
-    }, "Save your settings and exit."));
+    pg.items.push_back(MenuItem::action("Return to Hub", [this]() { returnToHub(); },
+                                        "Leave the game for the hub. This exact moment is kept: Continue Playing "
+                                        "brings you back to it."));
+    pg.items.push_back(MenuItem::action("Exit", [this]() { requestQuit(); },
+                                        "Saves everything (this exact moment too, for Continue Playing) and closes "
+                                        "the app."));
   };
   p->onLeave = [this]() { cfg.save(configPath); };
   return p;
@@ -908,11 +534,11 @@ std::string App::bindingsText(int a) const {
 
 std::shared_ptr<MenuPage> App::pageOptions() {
   auto p = std::make_shared<MenuPage>();
-  p->title = "Options";
+  p->title = "Settings";
   p->rebuild = [this](MenuPage& pg) {
     pg.items.clear();
     pg.items.push_back(MenuItem::submenu("Display", [this]() { menu.push(pageDisplay()); },
-                                         "Fullscreen, monitor, widescreen and scaling."));
+                                         "Widescreen, the picture's shape and scaling."));
     pg.items.push_back(MenuItem::submenu("Graphics", [this]() { menu.push(pageGraphics()); },
                                          "Filters, CRT effects and sprite options."));
     pg.items.push_back(MenuItem::submenu("Colour", [this]() { menu.push(pageColor()); },
@@ -920,7 +546,7 @@ std::shared_ptr<MenuPage> App::pageOptions() {
     pg.items.push_back(MenuItem::submenu("Audio", [this]() { menu.push(pageAudio()); },
                                          "Volume, latency and custom soundtracks (MSU-1 music packs)."));
     pg.items.push_back(MenuItem::submenu("Controls", [this]() { menu.push(pageControls()); },
-                                         "Keyboard and joypad bindings for both players."));
+                                         "On-screen controls, controllers and keyboards for both players."));
     pg.items.push_back(MenuItem::choice(
         "Menu Style", {"Storybook", "Retro", "Themed Dark", "Classic"}, [this]() { return cfg.menuStyle; },
         [this](int v) {
@@ -929,86 +555,19 @@ std::shared_ptr<MenuPage> App::pageOptions() {
         },
         "How these menus look: Storybook (bright and chunky), Retro (black, bricks and a pixel font), Themed Dark "
         "(dark, under the game's own heading) or Classic (the original dark panel)."));
-    pg.items.push_back(MenuItem::header("Launcher"));
-    pg.items.push_back(MenuItem::choice(
-        "Launcher Shows", {"Super Mario All-Stars", "The Four Games"}, [this]() { return cfg.launcherAllStars ? 0 : 1; },
-        [this](int v) {
-          cfg.launcherAllStars = v == 0;
-          launcher.setAllStarsOnly(cfg.launcherAllStars);
-        },
-        "Super Mario All-Stars: one card, the cartridge's own title and game select. The Four Games: a card "
-        "for each, straight to its save files."));
-    // The player's own covers and background (none come with the game).
-#ifdef __ANDROID__
-    const std::string where = "Choose each picture below (PNG or JPG).";
-#else
-    const std::string where = "Put PNG or JPG pictures in the covers folder (Open Covers Folder below): smb1, "
-                              "lostlevels, smb2, smb3 and allstars (the single card), and background.";
-#endif
+    pg.items.push_back(MenuItem::header("Leaving and coming back"));
     pg.items.push_back(MenuItem::toggle(
-        "Game Covers", [this]() { return cfg.launcherCovers ? 1 : 0; },
+        "Keep My Place", [this]() { return cfg.autoResume ? 1 : 0; },
         [this](int v) {
-          cfg.launcherCovers = v != 0;
-          applyLauncherArt();
+          cfg.autoResume = v != 0;
+          if (!v) dropResume();
         },
-        "The cards show your own cover pictures in place of their live previews; a card without one keeps its "
-        "preview. " + where));
-    pg.items.push_back(MenuItem::choice(
-        "Cover Shape", {"Fill the Frame", "Whole Cover"}, [this]() { return cfg.launcherCoverFill ? 0 : 1; },
-        [this](int v) {
-          cfg.launcherCoverFill = v == 0;
-          applyLauncherArt();
-        },
-        "Fill the Frame: the cover fills its card's square frame, its edges trimmed (a tall box's mostly from the "
-        "bottom). Whole Cover: all of it, with dark bars beside a tall one."));
+        "The exact moment you stop at is kept (when you leave the app, return to the hub, and once a minute while "
+        "you play), so Continue Playing takes you back to it, even if Android closed the app meanwhile."));
     pg.items.push_back(MenuItem::toggle(
-        "Custom Background", [this]() { return cfg.launcherBackground ? 1 : 0; },
-        [this](int v) {
-          cfg.launcherBackground = v != 0;
-          applyLauncherArt();
-        },
-        "The launcher's background is your own picture, filling the screen. " + where));
-#ifdef __ANDROID__
-    static const char* const kArtLabels[] = {"Super Mario Bros.", "The Lost Levels", "Super Mario Bros. 2",
-                                             "Super Mario Bros. 3", "Super Mario All-Stars"};
-    for (int k = 0; k <= Launcher::kCards; k++)
-      pg.items.push_back(MenuItem::action(std::string("Choose Cover: ") + kArtLabels[k], [this, k]() { pickArt(k); },
-                                          "A picture from your phone for this card (turn Game Covers on to see it)."));
-    pg.items.push_back(MenuItem::action("Choose Background", [this]() { pickArt(-1); },
-                                        "A picture from your phone for the launcher (turn Custom Background on)."));
-#else
-    pg.items.push_back(MenuItem::action("Open Covers Folder", [this]() {
-      const std::wstring dir = pathJoin(exeDir, L"covers");
-      makeDir(dir);
-      openFolder(dir);
-      menu.notify("Covers folder opened - pictures are read when you switch Game Covers on", 4.0f);
-    }, "Where your covers and background go. After adding pictures, switch Game Covers (or Custom Background) "
-       "off and on again to read them."));
-#endif
-    pg.items.push_back(MenuItem::header("Updates"));
-    pg.items.push_back(MenuItem::toggle(
-        "Check for Updates", [this]() { return cfg.checkUpdates ? 1 : 0; },
-        [this](int v) {
-          cfg.checkUpdates = v != 0;
-          applyUpdateTag(cfg.updateLatest);
-          if (cfg.checkUpdates) checkForUpdate(false);
-        },
-        std::string("Once a day the launcher looks up the latest release on GitHub (nothing about you or your game is "
-                    "sent) and shows a badge when there's a newer version than this one (") +
-            kAppVersion + ")."));
-    if (!updateTag.empty()) {
-      pg.items.push_back(MenuItem::action("Get Version " + updateVersion(), [this]() {
-        openUrl(UpdateCheck::pageFor(updateTag).c_str());
-        menu.notify("Opened the version " + updateVersion() + " download page in your browser");
-      }, "Opens its page on GitHub, where it can be downloaded. Your saves and settings carry over."));
-    } else {
-      pg.items.push_back(MenuItem::action(updater.running() ? "Checking..." : "Check Now", [this]() {
-        if (updater.running()) return;
-        checkForUpdate(true);
-        menu.notify("Checking for updates...", 2.0f);
-        menu.refresh();
-      }, std::string("Looks up the latest release on GitHub now. This is version ") + kAppVersion + "."));
-    }
+        "Pause When I Come Back", [this]() { return cfg.pauseOnReturn ? 1 : 0; },
+        [this](int v) { cfg.pauseOnReturn = v != 0; },
+        "Back from another app or a locked screen, the game waits on this menu until you choose Resume."));
     pg.items.push_back(MenuItem::header("Gameplay"));
     pg.items.push_back(MenuItem::toggle(
         "NES Brick Bounce", [this]() { return cfg.nesBrickBounce ? 1 : 0; },
@@ -1031,7 +590,8 @@ std::shared_ptr<MenuPage> App::pageOptions() {
     pg.items.push_back(MenuItem::header("Speed"));
     MenuItem ff = MenuItem::toggle("Fast Forward", [this]() { return cfg.fastForward && !achLocked() ? 1 : 0; },
                                    [this](int v) { cfg.fastForward = v != 0; },
-                                   "Hold " + bindingsText(kActFastForward) + " to run the game at 4x speed (sound off).");
+                                   "Hold the on-screen fast forward button (or " + bindingsText(kActFastForward) +
+                                       ") to run the game at 4x speed (sound off).");
     ff.enabled = [this]() { return !achLocked(); };
     ff.valueText = [this]() { return std::string(achLocked() ? "Off (achievements on)" : ""); };
     pg.items.push_back(ff);
@@ -1040,8 +600,8 @@ std::shared_ptr<MenuPage> App::pageOptions() {
                                      cfg.rewind = v != 0;
                                      if (!v) rewind.clear();
                                    },
-                                   "Hold " + bindingsText(kActRewind) +
-                                       " to step back through the last minute of play. Saved game progress is "
+                                   "Hold the on-screen rewind button (or " + bindingsText(kActRewind) +
+                                       ") to step back through the last minute of play. Saved game progress is "
                                        "never undone.");
     rw.enabled = [this]() { return !achLocked(); };
     rw.valueText = [this]() { return std::string(achLocked() ? "Off (achievements on)" : ""); };
@@ -1049,7 +609,7 @@ std::shared_ptr<MenuPage> App::pageOptions() {
     // (right under what it switches off)
     pg.items.push_back(MenuItem::header("Achievements"));
     pg.items.push_back(achievementsSwitch());
-    pg.items.push_back(MenuItem::header("Hotkeys"));
+    pg.items.push_back(MenuItem::header("Controller and keyboard shortcuts"));
     auto hot = [&](const char* what, int a) {
       MenuItem it = MenuItem::info(what);
       it.valueText = [this, a]() { return bindingsText(a); };
@@ -1060,7 +620,6 @@ std::shared_ptr<MenuPage> App::pageOptions() {
     hot("Load state", kActLoadState);
     hot("Fast forward (hold)", kActFastForward);
     hot("Rewind (hold)", kActRewind);
-    hot("Fullscreen", kActFullscreen);
     hot("Screenshot", kActScreenshot);
   };
   p->onLeave = [this]() { cfg.save(configPath); };
@@ -1077,13 +636,13 @@ void App::achNewRun(bool counts) {
 void App::setAchievements(bool on) {
   if (on == cfg.achievements) return;
   cfg.achievements = on;
-  // They only count in a game started with them on (from the launcher or
+  // They only count in a game started with them on (from the hub or
   // Reset Game): switched on mid-game, what cheats, the level select, fast
   // forward or rewind did in this game can't earn anything.
   if (game) game->achievements().counts = false;
   if (on) {
     rewind.clear();
-    if (!inLauncher) menu.notify("Achievements count from your next Reset Game", 4.0f);
+    if (!inHub) menu.notify("Achievements count from your next Reset Game", 4.0f);
   }
   applyConfig();  // cheats leave (or come back into) the running game
 }
@@ -1146,7 +705,7 @@ MenuItem App::achievementsSwitch() {
   MenuItem it = MenuItem::toggle(
       "Achievements", [this]() { return cfg.achievements ? 1 : 0; },
       [this](int v) {
-        if (v || inLauncher || !game || !game->achievements().counts) {
+        if (v || inHub || !game || !game->achievements().counts) {
           setAchievements(v != 0);
           cfg.save(configPath);
           menu.refresh();
@@ -1160,7 +719,7 @@ MenuItem App::achievementsSwitch() {
       },
       "On: earn achievements; cheats, level select, fast forward and rewind are off. Off: those come back.");
   it.valueText = [this]() {
-    return std::string(cfg.achievements && !inLauncher && game && !game->achievements().counts ? "from your next Reset Game"
+    return std::string(cfg.achievements && !inHub && game && !game->achievements().counts ? "from your next Reset Game"
                                                                                                 : "");
   };
   return it;
@@ -1174,7 +733,7 @@ std::shared_ptr<MenuPage> App::pageAchievements() {
     pg.items.clear();
     pg.items.push_back(achievementsSwitch());
     pg.items.push_back(MenuItem::action("Export to CSV", [this]() {
-      // (Windows / Linux: next to the settings; Android: where screenshots go, reachable over USB)
+      // (where screenshots go: the app's own folder on shared storage)
       const std::wstring dir = pathJoin(pathDir(shotDir), L"achievements export");
       std::string err;
       if (!exportAchievements(dir, achStore, &err)) {
@@ -1182,17 +741,12 @@ std::shared_ptr<MenuPage> App::pageAchievements() {
         return;
       }
       logf("achievements exported to %s", narrow(dir).c_str());
-#ifdef __ANDROID__
-      menu.notify("Exported to Android/data/com.darhkfox.allstars/files/achievements export", 6.0f);
-#else
-      openFolder(dir);
-      menu.notify("Achievements exported: achievements.csv and icons", 4.0f);
-#endif
+      menu.notify("Exported to the app's \"achievements export\" folder (beside its screenshots folder)", 6.0f);
     }, "Writes achievements.csv (ID, title, description, points, trophy, hidden, progress, unlocked and when, "
        "icons) and an icons folder, earned and locked, for tools such as PlayniteAchievements' spreadsheet import."));
     // the running game's first
     GameId order[4] = {GameId::SMB1, GameId::SMBLL, GameId::SMB2, GameId::SMB3};
-    GameId cur = inLauncher || !game ? Launcher::cardGame(launcher.card()) : game->current();
+    GameId cur = inHub || !game ? gameOfIndex(cfg.lastGame) : game->current();
     for (int i = 1; i < 4; i++)
       if (order[i] == cur) std::swap(order[0], order[i]);
     int total = 0, got = 0;
@@ -1242,7 +796,7 @@ void App::achWelcome() {
   p->items.push_back(MenuItem::info("Rescue princesses, defeat the bosses, find secrets and pull off tricky moves."));
   p->items.push_back(MenuItem::header("To keep them fair, while achievements are on"));
   p->items.push_back(MenuItem::info("Cheats, Level Select, Fast Forward and Rewind are switched off."));
-  p->items.push_back(MenuItem::info("Save states still work. Turn achievements off any time in Options."));
+  p->items.push_back(MenuItem::info("Save states still work. Turn achievements off any time in Settings."));
   p->items.push_back(MenuItem::separator());
   p->items.push_back(MenuItem::action("Play with achievements", [this]() { menu.closeAll(); },
                                       "Each one pops up as you earn it; the menu's Achievements page lists them all."));
@@ -1250,44 +804,9 @@ void App::achWelcome() {
     setAchievements(false);
     cfg.save(configPath);
     menu.closeAll();
-  }, "Cheats, Level Select, Fast Forward and Rewind stay available. Turn achievements on again in Options."));
+  }, "Cheats, Level Select, Fast Forward and Rewind stay available. Turn achievements on again in Settings."));
   menuAnim = 0;
   menu.push(p);
-}
-
-std::shared_ptr<MenuPage> App::pageCredits() {
-  auto p = std::make_shared<MenuPage>();
-  p->title = "Credits";
-  p->subtitle = "Super Mario All-Stars PC Port";
-  p->rebuild = [this](MenuPage& pg) {
-    pg.items.clear();
-    pg.items.push_back(MenuItem::separator("Find me over at"));
-    struct Link {
-      const char* site;
-      const char* shown;
-      const char* url;
-    };
-    static const Link kLinks[] = {
-        {"YouTube", "youtube.com/adhgaming", "https://www.youtube.com/adhgaming"},
-        {"Reddit", "u/Darhkwing", "https://www.reddit.com/user/Darhkwing"},
-        {"GitHub", "github.com/Darhkfox", "https://github.com/Darhkfox"},
-        {"X", "x.com/ADH_Gaming", "https://x.com/ADH_Gaming"},
-        {"Patreon", "patreon.com/c/TeamRedTail", "https://www.patreon.com/c/TeamRedTail"},
-    };
-    for (const Link& l : kLinks) {
-      MenuItem it = MenuItem::action(l.site, [this, l]() {
-        openUrl(l.url);
-        menu.notify(std::string("Opened ") + l.site + " in your browser");
-      }, "Opens it in your web browser.");
-      std::string shown = l.shown;
-      it.valueText = [shown]() { return shown; };
-      pg.items.push_back(it);
-    }
-    pg.items.push_back(MenuItem::separator());
-    pg.items.push_back(MenuItem::info("Super Mario All-Stars is © Nintendo."));
-    pg.items.push_back(MenuItem::info("This port contains no game data: it runs from your own ROM."));
-  };
-  return p;
 }
 
 std::shared_ptr<MenuPage> App::pageDisplay() {
@@ -1295,57 +814,18 @@ std::shared_ptr<MenuPage> App::pageDisplay() {
   p->title = "Display";
   p->rebuild = [this](MenuPage& pg) {
     pg.items.clear();
-#ifdef _WIN32
-    pg.items.push_back(MenuItem::choice(
-        "Display Mode", {"Windowed", "Borderless Fullscreen", "Exclusive Fullscreen"},
-        [this]() { return (int)cfg.displayMode; },
-        [this](int v) {
-          cfg.displayMode = (DisplayMode)v;
-          applyDisplayMode();
-          menu.refresh();
-        },
-        "Borderless is recommended. Alt+Enter or F11 toggles windowed mode."));
-    monitors = enumerateMonitors();
-    std::vector<std::string> names;
-    for (auto& m : monitors) names.push_back(narrow(m.name));
-    if (names.empty()) names.push_back("Primary");
-    pg.items.push_back(MenuItem::choice(
-        "Monitor", names,
-        [this]() {
-          for (size_t i = 0; i < monitors.size(); i++)
-            if (monitors[i].device == findMonitor(monitors, cfg.monitor).device) return (int)i;
-          return 0;
-        },
-        [this](int v) {
-          if (v >= 0 && v < (int)monitors.size()) cfg.monitor = monitors[v].device;
-          applyDisplayMode();
-        },
-        "Choose which display the game appears on."));
-    pg.items.push_back(MenuItem::slider("Window Size", 1, 8, 1, [this]() { return cfg.windowScale; },
-                                        [this](int v) {
-                                          cfg.windowScale = v;
-                                          if (cfg.displayMode == DisplayMode::Windowed) applyDisplayMode();
-                                        },
-                                        "x", "Window height as a multiple of the original 224 lines."));
-#elif !defined(__ANDROID__)
-    pg.items.push_back(MenuItem::choice(
-        "Display Mode", {"Windowed", "Fullscreen"},
-        [this]() { return cfg.displayMode == DisplayMode::Windowed ? 0 : 1; },
-        [this](int v) {
-          cfg.displayMode = v == 0 ? DisplayMode::Windowed : DisplayMode::Borderless;
-          applyDisplayMode();
-          menu.refresh();
-        },
-        "F11 toggles windowed mode."));
-#endif
     pg.items.push_back(MenuItem::choice(
         "Aspect Ratio", {"4:3 (Original)", "16:10 Widescreen", "16:9 Widescreen", "21:9 Ultrawide", "Auto (Fill Display)"},
         [this]() { return cfg.aspect; },
-        [this](int v) {
-          cfg.aspect = v;
-          if (cfg.displayMode == DisplayMode::Windowed) applyDisplayMode();
-        },
-        "Widescreen shows more of each level to the left and right. Auto matches your display."));
+        [this](int v) { cfg.aspect = v; },
+        "Widescreen shows more of each level to the left and right. Auto matches your display. (While the "
+        "on-screen controls are in use, Picture With Touch Controls below decides.)"));
+    pg.items.push_back(MenuItem::choice(
+        "Picture With Touch Controls", {"4:3, Controls Beside It", "As Aspect Ratio"},
+        [this]() { return cfg.touchPicture4x3 ? 0 : 1; }, [this](int v) { cfg.touchPicture4x3 = v == 0; },
+        "4:3: while you play with the on-screen controls the picture is the original 4:3 in the middle of the "
+        "screen, the controls at its sides. On a phone's wide screen they fit beside it, so your thumbs do not "
+        "cover the game. As Aspect Ratio: the picture is as wide as chosen above, the controls over it."));
     pg.items.push_back(MenuItem::choice("Pixel Shape", {"CRT (8:7, as on a TV)", "Square (1:1)"},
                                         [this]() { return cfg.pixelAspectCrt ? 0 : 1; },
                                         [this](int v) { cfg.pixelAspectCrt = v == 0; },
@@ -1380,36 +860,18 @@ std::shared_ptr<MenuPage> App::pageDisplay() {
     pg.items.push_back(MenuItem::choice("Side Borders", {"Black", "Blurred Game", "Dark Frame"},
                                         [this]() { return cfg.pillarbox; }, [this](int v) { cfg.pillarbox = v; },
                                         "What fills the screen where the game has nothing to show (menus, 4:3)."));
-#ifdef _WIN32
-    pg.items.push_back(MenuItem::toggle("VSync", [this]() { return cfg.vsync ? 1 : 0; },
-                                        [this](int v) { cfg.vsync = v; },
-                                        "On: synchronise with the display. Off: show frames at the game's own "
-                                        "60 fps (best with G-SYNC / FreeSync)."));
-    MenuItem bfi = MenuItem::toggle("Black Frame Insertion", [this]() { return cfg.blackFrames ? 1 : 0; },
-                                    [this](int v) { cfg.blackFrames = v != 0; },
-                                    "Sharper motion: a black frame between the game's frames, like a CRT. Needs a "
-                                    "120 Hz screen (or 180 / 240 Hz) and VSync; the picture gets darker.");
-    bfi.valueText = [this]() { return blackFramesNote(); };
-    pg.items.push_back(bfi);
-    MenuItem hfr = MenuItem::toggle("High Frame Rate", [this]() { return cfg.highFrameRate ? 1 : 0; },
-                                    [this](int v) { cfg.highFrameRate = v != 0; },
-                                    "Smoother motion on 100 Hz and faster screens: the refreshes between the game's "
-                                    "60 frames show in-between pictures (scrolling and sprites part of the way). The "
-                                    "game still runs at 60; the picture is one frame later. With VSync off "
-                                    "(G-SYNC / FreeSync) they're shown at the screen's rate. Not with Black Frame "
-                                    "Insertion.");
-    hfr.valueText = [this]() {
-      if (!cfg.highFrameRate) return std::string();
-      if (cfg.blackFrames) return std::string("off with Black Frame Insertion");
-      if (pacing.hz < 89) return "needs 100 Hz (now " + std::to_string((int)std::lround(pacing.hz)) + ")";
-      if (cfg.vsync && !pacing.perFrame) return std::to_string((int)std::lround(pacing.hz)) + " Hz, timed to each refresh";
-      return std::to_string((int)std::lround(pacing.hz)) + " Hz, " + std::to_string(hfrSubFrames() - 1) +
-             " in-between";
-    };
-    pg.items.push_back(hfr);
-#endif
+    pg.items.push_back(MenuItem::choice(
+        "Screen Refresh Rate", {"Device Default", "60 Hz (Matches the Games)"}, [this]() { return cfg.screen60 ? 1 : 0; },
+        [this](int v) {
+          cfg.screen60 = v != 0;
+          platform::preferSixtyHz(cfg.screen60);
+        },
+        "The games run at 60 frames a second. On a 90, 120 or 144 Hz screen, 60 Hz asks Android to run the screen "
+        "at 60 while SMAS Mobile is open, so every refresh shows one whole frame: steadier motion and less battery "
+        "use. Choose Device Default if the picture flickers or the phone ignores the request."));
     pg.items.push_back(MenuItem::toggle("Show FPS", [this]() { return cfg.showFps ? 1 : 0; },
-                                        [this](int v) { cfg.showFps = v; }));
+                                        [this](int v) { cfg.showFps = v; },
+                                        "The game's frames per second, top left. It should read about 60."));
   };
   return p;
 }
@@ -1424,17 +886,6 @@ std::shared_ptr<MenuPage> App::pageGraphics() {
                    "LCD Grid"},
         [this]() { return cfg.filter; }, [this](int v) { cfg.filter = v; },
         "Sharp Bilinear keeps pixels crisp without uneven sizes."));
-#ifdef _WIN32
-    MenuItem sl = MenuItem::submenu("Slang Shader", [this]() { menu.push(pageSlang()); },
-                                    "RetroArch slang shader presets (.slangp) from the 'shaders' folder next to the "
-                                    "game, in place of the filter above (and the colour settings).");
-    sl.valueText = [this]() {
-      if (cfg.slangPreset.empty()) return std::string("Off");
-      std::wstring n = std::filesystem::path(cfg.slangPreset).stem().wstring();
-      return narrow(n);
-    };
-    pg.items.push_back(sl);
-#endif
     pg.items.push_back(MenuItem::slider("Scanline / Effect Strength", 0, 100, 5, [this]() { return cfg.scanlines; },
                                         [this](int v) { cfg.scanlines = v; }, "%",
                                         "Strength of the CRT and LCD effects."));
@@ -1535,8 +986,6 @@ std::shared_ptr<MenuPage> App::pageAudio() {
                                           audio.flush();  // take effect now, not after a slow drift
                                         },
                                         " ms", "Lower values respond faster; raise it if you hear crackling."));
-    pg.items.push_back(MenuItem::toggle("Mute When Unfocused", [this]() { return cfg.muteUnfocused ? 1 : 0; },
-                                        [this](int v) { cfg.muteUnfocused = v; }));
     // MSU-1 music packs (app/msupack.h): Off, then the msu folder's packs
     pg.items.push_back(MenuItem::header("Custom Soundtrack (MSU-1)"));
     if (msuDir.empty()) msuDir = pathJoin(exeDir, L"msu");
@@ -1548,11 +997,13 @@ std::shared_ptr<MenuPage> App::pageAudio() {
     std::string help;
     if (!cfg.msuPack.empty() && cfg.msuPack == msuLoaded && !msuStatus.empty()) help = msuStatus + " ";
     else if (cfg.msuPack != msuLoaded)
-      help = inLauncher ? "Starts when you next start a game. "
+      help = inHub ? "Starts when you next start a game. "
                         : "Choose Restart With This Pack below to hear it now (or it starts with your next game). ";
-    help += packs->empty() ? "Put a pack in its own folder in the msu folder: its MSU-1 patch (.bps or .ips) and "
-                             "its tracks (.pcm), then come back here."
-                           : "A pack is a folder in the msu folder: its MSU-1 patch (.bps or .ips) and tracks (.pcm).";
+    help += packs->empty() ? "Put a pack in its own folder in the app's msu folder (on shared storage, beside its "
+                             "screenshots folder): its MSU-1 patch (.bps or .ips) and its tracks (.pcm), then come "
+                             "back here."
+                           : "A pack is a folder in the app's msu folder: its MSU-1 patch (.bps or .ips) and tracks "
+                             "(.pcm).";
     pg.items.push_back(MenuItem::choice(
         "Music Pack", names,
         [this, packs]() {
@@ -1562,15 +1013,15 @@ std::shared_ptr<MenuPage> App::pageAudio() {
         },
         [this, packs](int v) {
           cfg.msuPack = v <= 0 ? std::wstring() : (*packs)[(size_t)std::min<int>(v, (int)packs->size()) - 1];
-          if (inLauncher) {
+          if (inHub) {
             reloadForMsu();
             if (!cfg.msuPack.empty() && !(snes && snes->msu)) menu.notify(msuStatus, 5.0f);
           }
-          if (!test.on && test.runSeconds <= 0) cfg.save(configPath);
+          cfg.save(configPath);
           menu.refresh();  // (its help says what became of it)
         },
         help));
-    if (!inLauncher && snes && cfg.msuPack != msuLoaded) {
+    if (!inHub && snes && cfg.msuPack != msuLoaded) {
       // (in a game: the console is rebuilt with the pack, so the game starts again)
       pg.items.push_back(MenuItem::action("Restart With This Pack", [this]() {
         menu.confirm("Restart the game with this music?", [this]() { launchGame(playing); },
@@ -1583,12 +1034,6 @@ std::shared_ptr<MenuPage> App::pageAudio() {
                                           applyConfig();
                                         },
                                         "%"));
-#ifndef __ANDROID__
-    pg.items.push_back(MenuItem::action("Open MSU-1 Folder", [this]() {
-      makeDir(msuDir);
-      openFolder(msuDir);
-    }, "Where music packs go: one folder per pack."));
-#endif
   };
   return p;
 }
@@ -1598,22 +1043,34 @@ std::shared_ptr<MenuPage> App::pageControls() {
   p->title = "Controls";
   p->rebuild = [this](MenuPage& pg) {
     pg.items.clear();
-    pg.items.push_back(MenuItem::submenu("Player 1 Keyboard", [this]() { menu.push(pageBindings(0, false)); }));
-    pg.items.push_back(MenuItem::submenu("Player 1 Joypad", [this]() { menu.push(pageBindings(0, true)); }));
-    pg.items.push_back(MenuItem::submenu("Player 2 Keyboard", [this]() { menu.push(pageBindings(1, false)); }));
-    pg.items.push_back(MenuItem::submenu("Player 2 Joypad", [this]() { menu.push(pageBindings(1, true)); }));
+    pg.items.push_back(MenuItem::header("Touch screen"));
+    pg.items.push_back(MenuItem::submenu("On-Screen Controls", [this]() { menu.push(pageTouch()); },
+                                         "Their size, where each one sits, how see-through they are, vibration."));
+    pg.items.push_back(MenuItem::header("Controllers"));
     std::vector<std::string> pads;
+    int connected = 0;
     for (int i = 0; i < 8; i++) {
       const PadState* ps = input.pad(i);
       std::string n = "Pad " + std::to_string(i + 1);
       if (!ps) n += " (not connected)";
       else n += ": " + narrow(ps->name) + (ps->connected ? "" : " (unplugged)");
+      if (ps && ps->connected) connected++;
       pads.push_back(n);
     }
+    MenuItem found = MenuItem::info("Connected");
+    found.valueText = [connected]() {
+      return connected == 0 ? std::string("None") : connected == 1 ? std::string("1 controller") : std::to_string(connected) + " controllers";
+    };
+    pg.items.push_back(found);
     pg.items.push_back(MenuItem::choice("Player 1 Uses", pads, [this]() { return cfg.padIndex[0]; },
-                                        [this](int v) { cfg.padIndex[0] = v; }));
+                                        [this](int v) { cfg.padIndex[0] = v; },
+                                        "Which connected controller plays as player 1. A controller listed as "
+                                        "(generic) or (basic mode) may need its buttons assigned below."));
     pg.items.push_back(MenuItem::choice("Player 2 Uses", pads, [this]() { return cfg.padIndex[1]; },
                                         [this](int v) { cfg.padIndex[1] = v; }));
+    pg.items.push_back(MenuItem::submenu("Player 1 Controller Buttons", [this]() { menu.push(pageBindings(0, true)); },
+                                         "Which controller button does what. Choose a row, then press the button."));
+    pg.items.push_back(MenuItem::submenu("Player 2 Controller Buttons", [this]() { menu.push(pageBindings(1, true)); }));
     pg.items.push_back(MenuItem::choice("Select Button", {"Opens Menu", "Tap: Game Select  -  Hold: Menu"},
                                         [this]() { return cfg.selectMode; },
                                         [this](int v) { cfg.selectMode = v; },
@@ -1625,34 +1082,80 @@ std::shared_ptr<MenuPage> App::pageControls() {
           cfg.confirmRight = v != 0;
           applyConfig();
         },
-        "Which face button chooses in the menus and the launcher: the bottom one (A on an Xbox pad), or the right "
-        "one (A on a Nintendo pad); the other goes back. The games' own buttons are set by their TYPE A / TYPE B "
-        "and Button Bindings."));
+        "Which face button chooses in the menus and the hub: the bottom one (A on an Xbox pad), or the right one (A "
+        "on a Nintendo pad); the other goes back. The games' own buttons are set by their TYPE A / TYPE B and "
+        "the Controller Buttons pages."));
     pg.items.push_back(MenuItem::slider("Stick Deadzone", 10, 80, 5, [this]() { return cfg.deadzone; },
                                         [this](int v) { cfg.deadzone = v; }, "%"));
-#ifndef _WIN32
-    pg.items.push_back(MenuItem::header("Touch screen"));
-    pg.items.push_back(MenuItem::choice("On-Screen Controls", {"While Touching", "Always", "Never"},
-                                        [this]() { return cfg.touchMode; }, [this](int v) { cfg.touchMode = v; },
-                                        "While Touching: shown once you touch the screen, hidden when a controller "
-                                        "or keyboard is used."));
-    pg.items.push_back(MenuItem::slider("Controls Opacity", 10, 100, 10, [this]() { return cfg.touchOpacity; },
-                                        [this](int v) { cfg.touchOpacity = v; }, "%"));
-#endif
-    pg.items.push_back(MenuItem::action("Restore Default Controls", [this]() {
-      Config d;
-      d.setDefaults();
-      memcpy(cfg.keys, d.keys, sizeof(cfg.keys));
-      memcpy(cfg.pad, d.pad, sizeof(cfg.pad));
-      menu.notify("Controls reset");
+    pg.items.push_back(MenuItem::header("Keyboard"));
+    pg.items.push_back(MenuItem::submenu("Player 1 Keys", [this]() { menu.push(pageBindings(0, false)); },
+                                         "For a keyboard connected to the phone or tablet."));
+    pg.items.push_back(MenuItem::submenu("Player 2 Keys", [this]() { menu.push(pageBindings(1, false)); }));
+    pg.items.push_back(MenuItem::separator());
+    pg.items.push_back(MenuItem::action("Restore Default Buttons and Keys", [this]() {
+      menu.confirm("Restore the default buttons and keys?", [this]() {
+        Config d;
+        d.setDefaults();
+        memcpy(cfg.keys, d.keys, sizeof(cfg.keys));
+        memcpy(cfg.pad, d.pad, sizeof(cfg.pad));
+        cfg.save(configPath);
+        menu.notify("Buttons and keys reset");
+      }, "For both players. The on-screen controls are not changed.");
     }));
   };
+  p->onLeave = [this]() { cfg.save(configPath); };
+  return p;
+}
+
+// The on-screen controls: size, layout, opacity, vibration.
+std::shared_ptr<MenuPage> App::pageTouch() {
+  auto p = std::make_shared<MenuPage>();
+  p->title = "On-Screen Controls";
+  p->rebuild = [this](MenuPage& pg) {
+    pg.items.clear();
+    pg.items.push_back(MenuItem::choice("Show", {"While Touching", "Always", "Never"},
+                                        [this]() { return cfg.touchMode; }, [this](int v) { cfg.touchMode = v; },
+                                        "While Touching: shown once you touch the screen, hidden when a controller "
+                                        "or keyboard is used. Never: for playing with a controller only."));
+    pg.items.push_back(MenuItem::action("Move the Controls", [this]() { openTouchEditor(); },
+                                        "Shows the controls so you can drag each one to where your thumbs rest. "
+                                        "Nothing can be moved off the screen."));
+    pg.items.push_back(MenuItem::slider("Size", kTouchScaleMin, kTouchScaleMax, 5, [this]() { return cfg.touchScale; },
+                                        [this](int v) { cfg.touchScale = v; }, "%",
+                                        "How large the controls are. 100% suits most phones. Smaller suits a tablet; "
+                                        "larger if the buttons are hard to hit."));
+    pg.items.push_back(MenuItem::slider("Opacity", 10, 100, 10, [this]() { return cfg.touchOpacity; },
+                                        [this](int v) { cfg.touchOpacity = v; }, "%",
+                                        "How solid the controls look over the picture."));
+    pg.items.push_back(MenuItem::toggle("Vibrate On Press", [this]() { return cfg.touchHaptics ? 1 : 0; },
+                                        [this](int v) {
+                                          cfg.touchHaptics = v != 0;
+                                          if (v) platform::haptic();
+                                        },
+                                        "A short tick as a control is pressed, so you can feel it without looking. "
+                                        "(Follows the phone's own touch-vibration setting.)"));
+    pg.items.push_back(MenuItem::choice(
+        "Picture With Touch Controls", {"4:3, Controls Beside It", "As Aspect Ratio"},
+        [this]() { return cfg.touchPicture4x3 ? 0 : 1; }, [this](int v) { cfg.touchPicture4x3 = v == 0; },
+        "4:3: the picture sits in the middle of the screen with the controls at its sides. On a phone's wide screen "
+        "they fit beside it, so your thumbs do not cover the game. As Aspect Ratio: the picture as wide as Display > "
+        "Aspect Ratio says, the controls over it."));
+    pg.items.push_back(MenuItem::action("Restore the Standard Layout", [this]() {
+      menu.confirm("Put every control back in its standard place?", [this]() {
+        for (auto& o : cfg.touchOffset) o[0] = o[1] = 0;
+        cfg.touchScale = 100;
+        cfg.save(configPath);
+        menu.notify("On-screen controls reset");
+      }, "Size goes back to 100% too.");
+    }));
+  };
+  p->onLeave = [this]() { cfg.save(configPath); };
   return p;
 }
 
 std::shared_ptr<MenuPage> App::pageBindings(int player, bool pad) {
   auto p = std::make_shared<MenuPage>();
-  p->title = "Player " + std::to_string(player + 1) + (pad ? " Joypad" : " Keyboard");
+  p->title = "Player " + std::to_string(player + 1) + (pad ? " Controller" : " Keys");
   p->subtitle = pad ? "Positional layout: the bottom face button is SNES B" : "";
   p->rebuild = [this, player, pad](MenuPage& pg) {
     pg.items.clear();
@@ -1665,7 +1168,8 @@ std::shared_ptr<MenuPage> App::pageBindings(int player, bool pad) {
         return bindingName((pad ? cfg.pad : cfg.keys)[player][a]);
       };
       it.onActivate = [this, player, pad, a]() { startBind(player, pad, a); };
-      it.help = "Press Enter / A to change.";
+      it.help = pad ? "Choose it, then press the controller button (or move the stick) to use."
+                    : "Choose it, then press the key to use.";
       pg.items.push_back(it);
     }
   };
@@ -1779,7 +1283,7 @@ std::shared_ptr<MenuPage> App::pageLevelSelect() {
               cfg.save(configPath);
             }
             if (game->requestLevel(defs2[gi].game, w, l, &err, ch)) {
-              playing = defs2[gi].game;  // (Reset Game, Return to Launcher: this one now)
+              playing = defs2[gi].game;  // (Reset Game, Return to Hub: this one now)
               rewind.clear();
               achNewRun(false);  // (a level select run never counts)
               menu.closeAll();
@@ -1803,11 +1307,23 @@ std::shared_ptr<MenuPage> App::pageMusicPlayer() { return music.playerPage(this-
 void App::frame(double dt, int gameFrames) {
   dt = std::min(dt, 0.1);
   menu.tickToasts((float)dt);
+  screenTimer += dt;
+  if (screenTimer >= 2.0) {
+    screenTimer = 0;
+    refreshInsets();
+  }
+  pollPick();
   updateInput(dt);
-  updateTick();
+  menu.showKeys = !touchActive;  // (the footer's line of keys: for keys and controllers)
   if (bindAction >= 0) updateBind(dt);
-  if (inLauncher) {
-    frameLauncher(dt, gameFrames);
+  if (editingTouch) {
+    // (the layout editor: the game waits; Back or Confirm closes it)
+    MenuInput mi = menuInput();
+    if (mi.back || mi.confirm) closeTouchEditor();
+    return;
+  }
+  if (inHub || !snes) {
+    frameHub(dt);
     return;
   }
 
@@ -1824,11 +1340,13 @@ void App::frame(double dt, int gameFrames) {
     cfg.save(configPath);
     audio.flush();
   }
+  if (inHub || !snes) return;  // (the menu left the game: Return to Hub)
 
   music.update(dt, menu.open());
   bool emulate = !menu.open();
   if (rewinding && (!rewindHeld || !emulate)) endRewind();
   if ((!cfg.rewind || achLocked()) && rewind.snapshots()) rewind.clear();
+  const auto emuStart = std::chrono::steady_clock::now();
   if (emulate && rewindHeld && stepRewind(gameFrames)) {
     // (showing the past)
   } else if (emulate) {
@@ -1840,17 +1358,10 @@ void App::frame(double dt, int gameFrames) {
     for (int i = 0; i < runs; i++) {
       if (loading && (!game->levelLoading() || std::chrono::steady_clock::now() - start > std::chrono::milliseconds(12)))
         break;
-#ifdef _WIN32
-      if (at.on && at.padPos < at.pads.size() / 2) {  // (the recording mode's controllers)
-        snes->input[0] = at.pads[2 * at.padPos];
-        snes->input[1] = at.pads[2 * at.padPos + 1];
-        at.padPos++;
-      }
-#endif
       // (Of the frames a pass runs, only the last is drawn: a device that
-      // falls behind (a Galaxy A12: 30 fps, the sound stuttering) runs two a
-      // pass, and drawing is most of a frame's work. The game keeps its speed
-      // and its sound; the picture changes less often. Fast forward too.)
+      // falls behind runs two a pass, and drawing is most of a frame's work.
+      // The game keeps its speed and its sound; the picture changes less
+      // often. Fast forward too.)
       snes->ppu.skipRender = !loading && i < runs - 1;
       game->beforeFrame();
       snes->runFrame();
@@ -1862,7 +1373,7 @@ void App::frame(double dt, int gameFrames) {
       }
       audioBuf.clear();
       snes->takeAudio(audioBuf);
-      bool mute = (cfg.muteUnfocused && !focused) || fastForward || loading;
+      bool mute = fastForward || loading;
       if (!mute) audio.push(audioBuf.data(), audioBuf.size() / 2, Snes::kSampleRate);
       fpsFrames++;
       if (pendingSave >= 0 && !game->coopMidTurn()) saveState(pendingSave);
@@ -1872,10 +1383,38 @@ void App::frame(double dt, int gameFrames) {
     snes->ppu.skipRender = false;
     achFrame();
   }
+  // (for the log: how play is running, once a minute; nothing is logged per frame)
+  if (emulate) {
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - emuStart).count();
+    perf.window += dt;
+    perf.passes++;
+    perf.frames += gameFrames;
+    perf.emuMs += ms;
+    perf.worstMs = std::max(perf.worstMs, ms);
+    if (ms > 1000.0 / Snes::kFrameRate) perf.slow++;
+    if (perf.window >= 60.0) {
+      int underruns = 0, minQueued = 0;
+      audio.takeStats(&underruns, &minQueued);
+      logf("play: %.1f fps over %.0f s at %.1f Hz; emulation %.2f ms a pass (worst %.1f), %d slow passes; audio "
+           "underruns %d",
+           perf.frames / perf.window, perf.window, pacing.hz, perf.emuMs / std::max(1, perf.passes), perf.worstMs,
+           perf.slow, underruns);
+      perf = Perf();
+    }
+  }
+  // The games' own save files: within five seconds of the game writing them.
   sramTimer += dt;
   if (sramTimer > 5.0 && snes->sramDirty) {
     sramTimer = 0;
     saveSram();
+  }
+  // The resume point: once a minute of play, written on another thread.
+  if (emulate && !rewinding) {
+    resumeTimer += dt;
+    if (resumeTimer >= 60.0) {
+      resumeTimer = 0;
+      saveResume(false);
+    }
   }
   fpsTimer += dt;
   if (fpsTimer >= 0.5) {
@@ -1886,53 +1425,29 @@ void App::frame(double dt, int gameFrames) {
 }
 
 void App::render() {
-  Canvas* uiCtx = video.canvas();
-  const RectF all = rectF(0, 0, (float)video.width(), (float)video.height());
-  if (inLauncher || !snes) {
+  Canvas* ui = video.canvas();
+  const int W = video.width(), H = video.height();
+  char fpsText[32] = "";
+  if (inHub || !snes) {
     video.clear();
     video.beginUi();
-    menu.setAccent(launcher.accent());
-    {
-      const GameId g = Launcher::cardGame(launcher.card());
-      menu.setGameArt(g == GameId::SMB1 ? 1 : g == GameId::SMBLL ? 2 : g == GameId::SMB2 ? 3 : g == GameId::SMB3 ? 4 : 0);
+    if (editingTouch) {
+      drawTouchEditor(ui);
+    } else {
+      menu.setAccent(hub.accent());
+      menu.setGameArt(cfg.lastGame >= 0 && cfg.lastGame <= 3 ? cfg.lastGame + 1 : 0);
+      hub.draw(menu, W, H, insets);
+      if (menu.open()) menu.draw(W, H, menuAnim);
     }
-    launcher.setPixelAspect(cfg.pixelAspectCrt ? 8.0 / 7.0 : 1.0);
-    launcher.draw(menu, video.width(), video.height());
-    if (menu.open()) menu.draw(video.width(), video.height(), menuAnim);
-    char fpsText[32] = "";
-    if (cfg.showFps) snprintf(fpsText, sizeof fpsText, "%.1f FPS", fps);
-    menu.drawOsd(video.width(), video.height(), fpsText);
-    // (black frame insertion: drawn, then covered, so the timers run on)
-    if (blackFrame && uiCtx) uiCtx->fillRect(all, colorF(0, 0, 0, 1));
+    menu.drawOsd(W, H, fpsText);
     video.endUi();
     return;
   }
   IRect dest;
   int ext, srcW;
   computeLayout(&dest, &ext, &srcW);
-  // High frame rate: on the refreshes after a game frame, the in-between
-  // picture nearest the refresh's moment, the last frame k / K of the way to
-  // this one (shown a frame late: what lies between two frames is known once
-  // the second is drawn); the frame itself at its own moment.
-  const uint32_t* pic = snes->ppu.frame;
-  const int subs = snes->ppu.subFrames;
-  if (subs > 1 && !menu.open() && hfrT >= 0 && snes->ppu.subTimed) {
-    // (drawn at the refreshes' own moments: the one nearest this, or the frame)
-    double best = std::fabs(1.0 - hfrT);
-    for (int k = 1; k < subs; k++)
-      if (std::fabs(snes->ppu.subAt[k - 1] - hfrT) < best)
-        best = std::fabs(snes->ppu.subAt[k - 1] - hfrT), pic = snes->ppu.subFrame[k - 1];
-    if (hfrPrevOk && hfrPrev.size() == (size_t)(kLineW * kFrameH) && hfrT < best) pic = hfrPrev.data();
-  } else if (subs > 1 && !menu.open() && hfrT >= 0) {
-    int k = std::clamp((int)std::lround(hfrT * subs), 1, subs);
-    if (k < subs) pic = snes->ppu.subFrame[k - 1];
-  }
-  // (the last frame's picture, shown for a moment near it, at its own left
-  // margin: shown at this frame's, a room sliding to the middle jumped back
-  // and forth)
-  int from = kMaxExt - ext;
-  if (pic == hfrPrev.data()) from = std::clamp(kMaxExt - hfrPrevExt, 0, kLineW - srcW);
-  video.upload(pic + from, srcW, snes->ppu.frameHeight(), kLineW);
+  const int from = kMaxExt - ext;
+  video.upload(snes->ppu.frame + from, srcW, snes->ppu.frameHeight(), kLineW);
   VideoParams vp;
   vp.srcW = srcW;
   vp.srcH = snes->ppu.frameHeight();
@@ -1962,26 +1477,299 @@ void App::render() {
     default: menu.setGameArt(0); break;
   }
   switch (game->current()) {
-    case GameId::SMB1: menu.setAccent(colorF(0.93f, 0.33f, 0.27f)); break;    // Mario red
-    case GameId::SMBLL: menu.setAccent(colorF(0.36f, 0.76f, 0.40f)); break;   // Luigi green
-    case GameId::SMB2: menu.setAccent(colorF(0.66f, 0.52f, 0.95f)); break;    // dream purple
-    case GameId::SMB3: menu.setAccent(colorF(0.96f, 0.62f, 0.20f)); break;    // SMB3 orange
-    default: menu.setAccent(Launcher::gameAccent(playing)); break;                 // (its file panel)
+    case GameId::SMB1:
+    case GameId::SMBLL:
+    case GameId::SMB2:
+    case GameId::SMB3: menu.setAccent(gameAccent(game->current())); break;
+    default: menu.setAccent(gameAccent(playing)); break;  // (its file panel)
   }
   if (cfg.pillarbox == 2) {
     // dark frame: subtle border around the picture
     RectF r = rectF((float)dest.left - 2, (float)dest.top - 2, (float)dest.right + 2, (float)dest.bottom + 2);
-    if (Canvas* c = video.canvas()) c->strokeRect(r, 3.0f, colorF(0.25f, 0.25f, 0.3f, 1.0f));
+    if (ui) ui->strokeRect(r, 3.0f, colorF(0.25f, 0.25f, 0.3f, 1.0f));
   }
-#ifndef _WIN32
-  touch.draw(video.canvas(), cfg.touchOpacity / 100.0f);
-#endif
-  if (menu.open()) menu.draw(video.width(), video.height(), menuAnim);
-  char fpsText[32] = "";
+  if (editingTouch) {
+    drawTouchEditor(ui);
+  } else {
+    touch.draw(ui, cfg.touchOpacity / 100.0f);
+    if (menu.open()) menu.draw(W, H, menuAnim);
+  }
   if (cfg.showFps) snprintf(fpsText, sizeof fpsText, "%.1f FPS", fps);
-  menu.drawOsd(video.width(), video.height(), fpsText,
-               rewinding ? "<< Rewind" : fastForward ? ">> Fast Forward" : loading ? "Loading..." : "");
-  if (blackFrame && uiCtx) uiCtx->fillRect(all, colorF(0, 0, 0, 1));
+  menu.drawOsd(W, H, fpsText, rewinding ? "<< Rewind" : fastForward ? ">> Fast Forward" : loading ? "Loading..." : "");
   video.endUi();
 }
 
+// ---------------------------------------------------------------------------
+// On-screen controls
+
+bool App::touchShown() const {
+  if (editingTouch) return true;
+  return touchActive ? cfg.touchMode != 2 : cfg.touchMode == 1;
+}
+
+void App::refreshInsets() {
+  float l = 0, t = 0, r = 0, b = 0;
+  if (!platform::safeInsets(&l, &t, &r, &b)) l = t = r = b = 0;
+  // (never more than a fifth of the screen at an edge, whatever the system says)
+  const float W = (float)video.width(), H = (float)video.height();
+  insets[0] = std::clamp(l, 0.0f, W * 0.2f);
+  insets[1] = std::clamp(t, 0.0f, H * 0.2f);
+  insets[2] = std::clamp(r, 0.0f, W * 0.2f);
+  insets[3] = std::clamp(b, 0.0f, H * 0.2f);
+  menu.setSafeArea(insets[0], insets[1], insets[2], insets[3]);
+  // Text and rows of a size for the screen in hand. The menus measure
+  // everything by the screen's height, which suits a monitor or a TV; a
+  // phone's 1080 lines are 7 cm tall, so its text is scaled up to about 15 sp
+  // and the rows that can be tapped are at least 40 dp tall.
+  float dp = 0, sp = 0;
+  if (!platform::displayDensity(&dp, &sp) || dp < 0.5f || sp < 0.5f) dp = sp = H / 411.0f;  // (not known: as a phone's)
+  const float base = 26.0f * std::max(H / 1080.0f, 0.55f);  // (the menus' text at scale 1, in pixels)
+  menu.textScale = std::clamp(15.0f * sp / base, 1.0f, 1.75f);
+  menu.minRow = 40.0f * dp;
+}
+
+// Taps and drags: on the hub's tiles, the menus' rows, the layout editor; the
+// on-screen pad's Menu button.
+void App::touchFrame() {
+  touch.setInsets(insets[0], insets[1], insets[2], insets[3]);
+  touch.setAdjust(cfg.touchScale, cfg.touchOffset);
+  touch.layout((float)video.width(), (float)video.height());
+  touch.editing = editingTouch;
+  touch.inGame = !inHub && snes && !menu.open() && !editingTouch && !(game && game->levelLoading());
+  touch.visible = touchShown();
+  touch.showFF = cfg.fastForward && !achLocked();
+  touch.showRewind = cfg.rewind && !achLocked();
+  if (touch.takeHaptic() && cfg.touchHaptics) platform::haptic();
+  if (touch.takePressed(TouchControls::BtnMenu) && touch.inGame) openMenu();
+  float dy = touch.takeDrag(), x = 0, y = 0;
+  bool tapped = touch.takeTap(&x, &y);
+  if (editingTouch) {
+    if (touch.takeMoved()) touch.getOffsets(cfg.touchOffset);
+    if (tapped) editorTap(x, y);
+  } else if (menu.open()) {
+    if (dy != 0) menu.drag(dy);
+    if (tapped) menu.tap(x, y);
+  } else if (inHub && tapped) {
+    hubTap = hub.tap(x, y);
+  }
+  // The system's edge gestures keep off the controls while they are in use.
+  IRect rects[kTouchGroupCount];
+  const int n = touch.inGame && touch.visible ? touch.controlRects(rects, kTouchGroupCount) : 0;
+  unsigned key = (unsigned)n * 2654435761u;
+  for (int i = 0; i < n; i++)
+    key = (key ^ (unsigned)(rects[i].left * 31 + rects[i].top * 131 + rects[i].right * 517 + rects[i].bottom * 1031)) *
+          16777619u;
+  if (key != exclusionKey) {
+    exclusionKey = key;
+    platform::setGestureExclusion(rects, n);
+  }
+}
+
+namespace {
+// The layout editor's buttons, top centre: Smaller, Larger, Reset, Done.
+struct EditorUi {
+  RectF btn[4];
+  RectF hint;
+};
+EditorUi editorUi(float W, float H, const float in[4]) {
+  EditorUi e;
+  const float u = (H - in[1] - in[3]) / 8.0f, bw = u * 1.75f, bh = u * 0.72f, gap = u * 0.16f;
+  const float total = bw * 4 + gap * 3, x0 = in[0] + (W - in[0] - in[2] - total) * 0.5f, y0 = in[1] + u * 0.22f;
+  for (int i = 0; i < 4; i++) e.btn[i] = rectF(x0 + i * (bw + gap), y0, x0 + i * (bw + gap) + bw, y0 + bh);
+  e.hint = rectF(in[0], y0 + bh + u * 0.1f, W - in[2], y0 + bh + u * 0.55f);
+  return e;
+}
+}  // namespace
+
+void App::openTouchEditor() {
+  editorFromGame = !inHub && snes;
+  menu.closeAll();
+  touch.releaseAll();
+  editingTouch = true;
+  touch.editing = true;
+  touchActive = true;
+}
+
+void App::closeTouchEditor() {
+  if (!editingTouch) return;
+  touch.getOffsets(cfg.touchOffset);
+  editingTouch = false;
+  touch.editing = false;
+  touch.releaseAll();
+  cfg.save(configPath);
+  // (back to the page it was opened from)
+  if (editorFromGame) openMenu();
+  pushPage(pageTouch());
+  prevMenuNav[4] = prevMenuNav[5] = true;
+}
+
+bool App::editorTap(float x, float y) {
+  const EditorUi e = editorUi((float)video.width(), (float)video.height(), insets);
+  auto in = [&](const RectF& r) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; };
+  if (in(e.btn[0])) cfg.touchScale = std::max(kTouchScaleMin, cfg.touchScale - 5);
+  else if (in(e.btn[1])) cfg.touchScale = std::min(kTouchScaleMax, cfg.touchScale + 5);
+  else if (in(e.btn[2])) {
+    for (auto& o : cfg.touchOffset) o[0] = o[1] = 0;
+    cfg.touchScale = 100;
+  } else if (in(e.btn[3])) {
+    closeTouchEditor();
+  } else {
+    return false;
+  }
+  if (cfg.touchHaptics) platform::haptic();
+  return true;
+}
+
+void App::drawTouchEditor(Canvas* cv) {
+  if (!cv) return;
+  const float W = (float)video.width(), H = (float)video.height();
+  const bool overGame = !inHub && snes;
+  cv->fillRect(rectF(0, 0, W, H), colorF(0.03f, 0.04f, 0.08f, overGame ? 0.45f : 1.0f));
+  if (!overGame) {
+    // (no game on screen: where its picture will be)
+    const float sh = H - insets[1] - insets[3], sw = W - insets[0] - insets[2];
+    float pw = cfg.touchPicture4x3 ? std::min(sw, sh * (256.0f * 8.0f / 7.0f) / 224.0f) : sw;
+    const RectF pic = rectF(insets[0] + (sw - pw) * 0.5f, insets[1], insets[0] + (sw + pw) * 0.5f, insets[1] + sh);
+    cv->fillRect(pic, colorF(0.10f, 0.13f, 0.22f, 1.0f));
+    cv->strokeRect(pic, std::max(2.0f, H / 400.0f), colorF(1, 1, 1, 0.25f));
+    menu.text(L"The game's picture", pic, H / 28.0f, false, colorF(1, 1, 1, 0.35f), kAlignCenter);
+  }
+  touch.draw(cv, 1.0f);
+  const EditorUi e = editorUi(W, H, insets);
+  static const wchar_t* const kNames[4] = {L"Smaller", L"Larger", L"Reset", L"Done"};
+  for (int i = 0; i < 4; i++) {
+    const RectF& r = e.btn[i];
+    const float rad = (r.bottom - r.top) * 0.3f;
+    cv->fillRound(r, rad, i == 3 ? colorF(0.16f, 0.46f, 0.80f, 0.95f) : colorF(0.12f, 0.15f, 0.25f, 0.95f));
+    cv->strokeRound(r, rad, std::max(2.0f, H / 500.0f), colorF(1, 1, 1, 0.5f));
+    menu.text(kNames[i], r, (r.bottom - r.top) * 0.42f, true, colorF(1, 1, 1, 1), kAlignCenter);
+  }
+  const int g = touch.editGroup();
+  const std::string size = "Size " + std::to_string(cfg.touchScale) + "%";
+  const std::wstring hint = Menu::widen(g >= 0 ? std::string("Moving: ") + touchGroupName(g) + "      " + size +
+                                                     "      Drag any control to move it"
+                                               : "Drag any control to where your thumb rests      " + size);
+  menu.text(hint, e.hint, (e.hint.bottom - e.hint.top) * 0.62f, false, colorF(1, 1, 1, 0.9f), kAlignCenter);
+}
+
+// ---------------------------------------------------------------------------
+// Starting, stopping, and Android's lifecycle
+
+void App::start(const std::wstring& dataDir, const std::wstring& sharedDir) {
+  exeDir = dataDir;
+  configPath = pathJoin(exeDir, L"smas_port.ini");
+  saveDir = pathJoin(exeDir, L"saves");
+  romDir = pathJoin(exeDir, L"roms");
+  tmpDir = pathJoin(exeDir, L"tmp");
+  shotDir = pathJoin(sharedDir, L"screenshots");
+  msuDir = pathJoin(sharedDir, L"msu");
+  logPath = pathJoin(sharedDir, kLogFileName);
+  makeDir(saveDir);
+  makeDir(romDir);
+  makeDir(tmpDir);
+  // (what an import or export left behind if the app was closed in its middle)
+  std::vector<std::wstring> stale;
+  if (listFiles(tmpDir, stale))
+    for (const std::wstring& n : stale) removeFile(pathJoin(tmpDir, n));
+  logf("%s %s (built on SuperMarioAllStars %s) starting", kAppName, kAppVersion, kUpstreamVersion);
+  logf("device: %s", platform::deviceSummary().c_str());
+  if (!cfg.load(configPath)) cfg.save(configPath);
+  battery.setDir(saveDir, appVersionNumber());
+  if (!audio.init(cfg.audioLatency)) {
+    logf("audio device unavailable");
+    menu.notify("Sound could not be started on this device", 5.0f);
+  }
+  input.init();
+  menu.setCanvas(video.canvas());
+  menu.touchUi = true;
+  refreshInsets();
+  platform::preferSixtyHz(cfg.screen60);
+
+  const bool haveRom = loadRom();
+  logf(haveRom ? "game file loaded (%s)" : "no game file yet%s", haveRom ? romInfo.headline.c_str() : "");
+  achStore.load(pathJoin(exeDir, L"achievements.ini"));
+  playing = gameOfIndex(cfg.lastGame);
+  if (haveRom) romReady();
+  applyConfig();
+  inHub = true;
+  checkResume();
+  refreshHub();
+  if (!achStore.noticeShown && haveRom) {
+    achStore.noticeShown = true;
+    achStore.save();
+    if (cfg.achievements) achWelcome();
+  }
+}
+
+void App::stop() {
+  if (rewinding) endRewind();
+  saveSram();
+  saveResume(true);
+  writer.flush();
+  cfg.save(configPath);
+  music.shutdown();
+  logf("stopped");
+}
+
+void App::requestQuit() {
+  onBackground();
+  menu.closeAll();
+  running = false;
+}
+
+// The app is leaving the screen (Home, another app, the screen locked).
+// Android may end the process at any moment after this without another word,
+// so everything is put on disk now: the games' own saves, the exact moment of
+// play (for Continue Playing), the settings.
+void App::onBackground() {
+  logf("lifecycle: to the background");
+  if (rewinding) endRewind();
+  saveSram();
+  saveResume(true);
+  cfg.save(configPath);
+  touch.releaseAll();
+  input.clearKeys();
+  for (auto& s : padSwallow) s = 0xffff;  // (nothing held carries over)
+  // Back on screen, the game waits on the pause menu until Resume.
+  if (cfg.pauseOnReturn && !inHub && snes && !menu.open() && !editingTouch && game && !game->levelLoading()) openMenu();
+  audio.flush();
+}
+
+void App::onForeground() {
+  logf("lifecycle: to the foreground");
+  refreshInsets();
+  input.rescanDevices();
+  touch.releaseAll();
+  input.clearKeys();
+  audio.flush();
+}
+
+// Android is short of memory: the rewind buffer (the largest thing the app
+// holds) is given up; it fills again as play goes on.
+void App::onLowMemory() {
+  logf("lifecycle: low memory (rewind buffer released)");
+  if (rewinding) endRewind();
+  rewind.clear();
+}
+
+void App::onTerminating() {
+  logf("lifecycle: terminating");
+  if (rewinding) endRewind();
+  saveSram();
+  saveResume(true);
+  writer.flush();
+  cfg.save(configPath);
+}
+
+// The graphics context was lost and made again (the platform has rebuilt the
+// video layer): the menus draw on its new canvas.
+void App::onDeviceReset() {
+  logf("lifecycle: graphics context rebuilt");
+  menu.setCanvas(video.canvas());
+  refreshInsets();
+}
+
+void App::onResized(int w, int h) {
+  video.resize(w, h);
+  refreshInsets();
+}

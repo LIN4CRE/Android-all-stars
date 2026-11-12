@@ -1,9 +1,32 @@
 // Controllers and keyboards on Android: see input_sdl.h.
 #include "platform/android/input_sdl.h"
 #include <SDL.h>
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include "app/canvas.h"
 #include "app/vkeys.h"
+
+namespace {
+// "Basic mode" state, written by Android's UI thread, read by poll().
+std::atomic<uint32_t> g_basicButtons{0};
+std::atomic<int> g_basicX{0}, g_basicY{0};  // thousandths
+std::atomic<bool> g_basicSeen{false};
+std::mutex g_basicNameLock;
+std::string g_basicName;
+}  // namespace
+
+void inputBasicPad(uint32_t buttons, float x, float y) {
+  g_basicButtons.store(buttons, std::memory_order_relaxed);
+  g_basicX.store((int)(x * 1000.0f), std::memory_order_relaxed);
+  g_basicY.store((int)(y * 1000.0f), std::memory_order_relaxed);
+  g_basicSeen.store(true, std::memory_order_relaxed);
+}
+
+void inputBasicPadName(const char* name) {
+  std::lock_guard<std::mutex> lock(g_basicNameLock);
+  g_basicName = name ? name : "";
+}
 
 bool Input::init() {
   SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");  // buttons by position (Nintendo pads too)
@@ -15,9 +38,24 @@ bool Input::init() {
 void Input::shutdown() {
   for (auto*& c : ctl_)
     if (c) SDL_GameControllerClose((SDL_GameController*)c);
+  for (auto*& j : joy_)
+    if (j) SDL_JoystickClose((SDL_Joystick*)j);
   ctl_.clear();
+  joy_.clear();
   pads_.clear();
+  basicSlot_ = -1;
   clearKeys();
+}
+
+// A free slot (one whose pad was unplugged, or a new one); -1 when all are taken.
+int Input::newSlot() {
+  for (size_t i = 0; i < pads_.size(); i++)
+    if (!ctl_[i] && !joy_[i] && (int)i != basicSlot_) return (int)i;
+  if ((int)pads_.size() >= kMaxPads) return -1;
+  ctl_.push_back(nullptr);
+  joy_.push_back(nullptr);
+  pads_.push_back(PadState());
+  return (int)pads_.size() - 1;
 }
 
 void Input::onKey(int vk, bool down) {
@@ -37,44 +75,76 @@ bool Input::anyPad() const {
   return false;
 }
 
+bool Input::anyPadActivity() const {
+  for (const PadState& p : pads_) {
+    if (!p.connected) continue;
+    for (bool b : p.buttons)
+      if (b) return true;
+    for (int a = 0; a < 4; a++)
+      if (p.axes[a] > 0.6f || p.axes[a] < -0.6f) return true;
+  }
+  return false;
+}
+
 // Pads keep the slot they first got; an unplugged one leaves it disconnected.
 void Input::scan() {
   rescan_ = false;
-  for (size_t i = 0; i < ctl_.size(); i++)
+  for (size_t i = 0; i < ctl_.size(); i++) {
     if (ctl_[i] && !SDL_GameControllerGetAttached((SDL_GameController*)ctl_[i])) {
       SDL_GameControllerClose((SDL_GameController*)ctl_[i]);
       ctl_[i] = nullptr;
       pads_[i].connected = false;
     }
+    if (joy_[i] && !SDL_JoystickGetAttached((SDL_Joystick*)joy_[i])) {
+      SDL_JoystickClose((SDL_Joystick*)joy_[i]);
+      joy_[i] = nullptr;
+      pads_[i].connected = false;
+    }
+  }
   for (int j = 0; j < SDL_NumJoysticks(); j++) {
-    if (!SDL_IsGameController(j)) continue;
     SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(j);
     bool open = false;
     for (auto* c : ctl_)
       if (c && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick((SDL_GameController*)c)) == id) open = true;
+    for (auto* k : joy_)
+      if (k && SDL_JoystickInstanceID((SDL_Joystick*)k) == id) open = true;
     if (open) continue;
-    SDL_GameController* c = SDL_GameControllerOpen(j);
-    if (!c) continue;
-    size_t slot = ctl_.size();
-    for (size_t i = 0; i < ctl_.size(); i++)
-      if (!ctl_[i]) {
-        slot = i;
-        break;
-      }
-    if (slot == ctl_.size()) {
-      if ((int)slot >= kMaxPads) {
+    if (SDL_IsGameController(j)) {
+      SDL_GameController* c = SDL_GameControllerOpen(j);
+      if (!c) continue;
+      const int slot = newSlot();
+      if (slot < 0) {
         SDL_GameControllerClose(c);
         continue;
       }
-      ctl_.push_back(nullptr);
-      pads_.push_back(PadState());
+      ctl_[slot] = (_SDL_GameController*)c;
+      PadState& p = pads_[slot];
+      p = PadState();
+      p.connected = true;
+      const char* n = SDL_GameControllerName(c);
+      p.name = widenUtf8(n ? n : "Controller");
+      continue;
     }
-    ctl_[slot] = (_SDL_GameController*)c;
+    // A pad SDL has no layout for: its buttons, hat and axes as they come.
+    // (Not sensors and the like: something with buttons or a hat.)
+    SDL_Joystick* js = SDL_JoystickOpen(j);
+    if (!js) continue;
+    if (SDL_JoystickNumButtons(js) < 2 && SDL_JoystickNumHats(js) < 1) {
+      SDL_JoystickClose(js);
+      continue;
+    }
+    const int slot = newSlot();
+    if (slot < 0) {
+      SDL_JoystickClose(js);
+      continue;
+    }
+    joy_[slot] = (_SDL_Joystick*)js;
     PadState& p = pads_[slot];
     p = PadState();
     p.connected = true;
-    const char* n = SDL_GameControllerName(c);
-    p.name = widenUtf8(n ? n : "Controller");
+    p.kind = PadState::Generic;
+    const char* n = SDL_JoystickName(js);
+    p.name = widenUtf8(std::string(n ? n : "Controller") + " (generic)");
   }
 }
 
@@ -89,9 +159,49 @@ void Input::poll() {
       SDL_CONTROLLER_BUTTON_RIGHTSTICK, SDL_CONTROLLER_BUTTON_DPAD_UP,   SDL_CONTROLLER_BUTTON_DPAD_DOWN,
       SDL_CONTROLLER_BUTTON_DPAD_LEFT, SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
   };
-  for (size_t i = 0; i < ctl_.size(); i++) {
+  // "Basic mode": a pad that only reaches the app as key presses (see input_sdl.h).
+  if (basicSlot_ < 0 && g_basicSeen.load(std::memory_order_relaxed)) {
+    basicSlot_ = newSlot();
+    if (basicSlot_ >= 0) {
+      PadState& p = pads_[basicSlot_];
+      p = PadState();
+      p.connected = true;
+      p.kind = PadState::Basic;
+      std::lock_guard<std::mutex> lock(g_basicNameLock);
+      p.name = widenUtf8((g_basicName.empty() ? std::string("Controller") : g_basicName) + " (basic mode)");
+    }
+  }
+  for (size_t i = 0; i < pads_.size(); i++) {
     SDL_GameController* c = (SDL_GameController*)ctl_[i];
+    SDL_Joystick* js = (SDL_Joystick*)joy_[i];
     PadState& p = pads_[i];
+    if ((int)i == basicSlot_) {
+      const uint32_t bits = g_basicButtons.load(std::memory_order_relaxed);
+      for (int b = 0; b < 32 && b < kPadButtons; b++) p.buttons[b] = (bits >> b) & 1;
+      p.axes[0] = g_basicX.load(std::memory_order_relaxed) / 1000.0f;
+      p.axes[1] = g_basicY.load(std::memory_order_relaxed) / 1000.0f;
+      continue;
+    }
+    if (js) {
+      // Buttons 0-9 as they come; the first hat as the D-pad (10-13); any more
+      // buttons after the standard sixteen. Axes 0-5 as they come.
+      std::memset(p.buttons, 0, sizeof(p.buttons));
+      const int nb = SDL_JoystickNumButtons(js);
+      for (int b = 0; b < nb; b++) {
+        const int to = b < 10 ? b : b + 6;
+        if (to < kPadButtons) p.buttons[to] = SDL_JoystickGetButton(js, b) != 0;
+      }
+      if (SDL_JoystickNumHats(js) > 0) {
+        const Uint8 h = SDL_JoystickGetHat(js, 0);
+        p.buttons[10] = (h & SDL_HAT_UP) != 0;
+        p.buttons[11] = (h & SDL_HAT_DOWN) != 0;
+        p.buttons[12] = (h & SDL_HAT_LEFT) != 0;
+        p.buttons[13] = (h & SDL_HAT_RIGHT) != 0;
+      }
+      const int na = SDL_JoystickNumAxes(js);
+      for (int a = 0; a < 6; a++) p.axes[a] = a < na ? SDL_JoystickGetAxis(js, a) / 32767.0f : 0.0f;
+      continue;
+    }
     if (!c) {
       std::memset(p.buttons, 0, sizeof(p.buttons));
       std::memset(p.axes, 0, sizeof(p.axes));

@@ -1,7 +1,6 @@
-// Video on Android: OpenGL ES 3.0. The game picture with the same filters and
-// colour settings as the Direct3D 11 one (app/video.cpp), then the UI drawn on
-// a Canvas (canvas.h) whose text comes from Android's own font engine
-// (SmasActivity.renderGlyphs, through JNI).
+// Video on Android: OpenGL ES 3.0. The game picture with its filters and
+// colour settings, then the UI drawn on a Canvas (canvas.h) whose text comes
+// from Android's own font engine (SmasActivity.renderGlyphs, through JNI).
 #pragma once
 #include <cstdint>
 #include <memory>
@@ -9,9 +8,6 @@
 #include "app/canvas.h"
 #include <string>
 
-#ifndef __ANDROID__
-extern std::string g_fontDir;  // (desktop Linux: where the fonts are, beside the program; see app_linux.cpp)
-#endif
 
 struct VideoParams {
   int srcW = 256, srcH = 224;  // active source size (pixels)
@@ -36,6 +32,9 @@ public:
   Video();
   ~Video();
   bool init(SDL_Window* window);
+  // The graphics context was lost and replaced (see video_gles.cpp): everything
+  // in it is made again. False if that failed.
+  bool recover();
   void shutdown();
   void resize(int w, int h);
   int width() const { return w_; }
@@ -58,5 +57,6 @@ private:
   int texW_ = 0, texH_ = 0;
   int loc_[12] = {};
   std::unique_ptr<GlesCanvas> canvas_;
+  bool build();
   void pass(const VideoParams& p, int pass, int x, int y, int w, int h);
 };

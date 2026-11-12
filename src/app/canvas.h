@@ -1,8 +1,8 @@
-// The 2D drawing the menus, the launcher and the music player use, the same
-// on every platform: filled and outlined shapes, text in the system's UI font
-// and the launcher's preview pictures. Implementations: canvas_d2d.cpp
-// (Direct2D / DirectWrite, Windows) and platform/android/canvas_gles.cpp
-// (OpenGL ES, text from Android's own font).
+// The 2D drawing the hub, the menus and the music player use: filled and
+// outlined shapes, text in the system's UI font, and pictures. Implemented
+// for Android in platform/android/video_gles.cpp (OpenGL ES, text from
+// Android's own font engine); the host tests have one that records what is
+// drawn (tests/host/fake_platform.cpp).
 #pragma once
 #include <cstdint>
 #include <string>
@@ -44,8 +44,8 @@ public:
   // a quad); filled, or outlined.
   virtual void fillPolygon(const PointF* pts, int n, ColorF c) = 0;
   virtual void strokePolygon(const PointF* pts, int n, float width, ColorF c) = 0;
-  // Many polygons kept for drawing again (the launcher's checkerboard floor,
-  // its stars): `counts` points each, one after another in `pts`. Drawn
+  // Many polygons kept for drawing again: `counts` points each, one after
+  // another in `pts`. Drawn
   // scaled by `scale` about the origin, then moved by (tx, ty).
   virtual int makeShape(const std::vector<PointF>& pts, const std::vector<int>& counts) = 0;
   virtual void fillShape(int shape, ColorF c, float scale = 1.0f, float tx = 0, float ty = 0) = 0;
@@ -55,8 +55,8 @@ public:
   virtual void text(const std::wstring& s, RectF r, float size, int weight, ColorF c, TextAlign align = kAlignLeading,
                     ParaAlign para = kParaCenter) = 0;
   virtual float measure(const std::wstring& s, float size, int weight) = 0;  // width in pixels
-  // ... in the title font (Luckiest Guy, third_party/fonts: the launcher's heading); the UI font, bold,
-  // where it isn't found.
+  // ... in the title font (Luckiest Guy, third_party/fonts); the UI font,
+  // bold, where it isn't found.
   virtual void titleText(const std::wstring& s, RectF r, float size, ColorF c, TextAlign align = kAlignLeading,
                          ParaAlign para = kParaCenter) = 0;
   virtual float measureTitle(const std::wstring& s, float size) = 0;
@@ -72,6 +72,6 @@ public:
   virtual void freeImage(int image) = 0;
 };
 
-// UTF-8 to UTF-16 (wchar_t: 16 bits on Windows, 32 elsewhere).
+// UTF-8 to and from wide strings (wchar_t is 32 bits on Android and Linux).
 std::wstring widenUtf8(const std::string& s);
 std::string narrowUtf8(const std::wstring& w);

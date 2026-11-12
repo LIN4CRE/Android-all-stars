@@ -2,14 +2,8 @@
 #include "platform/android/video_gles.h"
 #include <SDL.h>
 #include <GLES3/gl3.h>
-#ifdef __ANDROID__
 #include <android/log.h>
 #include <jni.h>
-#else
-#include <cstdio>
-#include <ft2build.h>
-#include FT_FREETYPE_H
-#endif
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -19,30 +13,7 @@
 
 namespace {
 
-#ifdef __ANDROID__
-void logError(const char* msg) { __android_log_print(ANDROID_LOG_ERROR, "SmasPort", "%s", msg); }
-#else
-void logError(const char* msg) { fprintf(stderr, "SmasPort: %s\n", msg); }
-
-// Desktop Linux: glyphs by FreeType, from the fonts beside the program (the
-// title's Luckiest Guy; DejaVu Sans for the rest), else the system's DejaVu.
-FT_Face loadFace(const char* file) {
-  static FT_Library lib = nullptr;
-  static std::map<std::string, FT_Face> faces;
-  if (!lib && FT_Init_FreeType(&lib) != 0) return nullptr;
-  auto it = faces.find(file);
-  if (it != faces.end()) return it->second;
-  FT_Face face = nullptr;
-  for (const std::string& dir : {g_fontDir, std::string("/usr/share/fonts/truetype/dejavu"),
-                                 std::string("/usr/share/fonts/TTF"), std::string("/usr/share/fonts/dejavu")}) {
-    if (dir.empty()) continue;
-    if (FT_New_Face(lib, (dir + "/" + file).c_str(), 0, &face) == 0) break;
-    face = nullptr;
-  }
-  faces[file] = face;
-  return face;
-}
-#endif
+void logError(const char* msg) { __android_log_print(ANDROID_LOG_ERROR, "SmasMobile", "%s", msg); }
 
 GLuint compile(GLenum type, const std::string& src) {
   GLuint s = glCreateShader(type);
@@ -341,6 +312,8 @@ public:
   ~GlesCanvas() override { release(); }
   bool create();
   void release();
+  // The graphics context is gone: its objects' names are forgotten, not deleted.
+  void abandon();
   void begin(int w, int h);
   void end() { flush(); }
 
@@ -495,6 +468,12 @@ void GlesCanvas::release() {
   if (vb_) glDeleteBuffers(1, &vb_);
   if (ib_) glDeleteBuffers(1, &ib_);
   if (vao_) glDeleteVertexArrays(1, &vao_);
+  prog_ = vb_ = ib_ = vao_ = 0;
+}
+
+void GlesCanvas::abandon() {
+  fonts_.clear();
+  images_.clear();
   prog_ = vb_ = ib_ = vao_ = 0;
 }
 
@@ -710,40 +689,6 @@ bool GlesCanvas::buildFont(Font& f, float px, bool bold, bool title) {
   for (uint32_t c : kExtraCps) cps.push_back(c);
   std::vector<int> meta;
   std::vector<uint8_t> bits;
-#ifndef __ANDROID__
-  FT_Face face = loadFace(title ? "LuckiestGuy-Regular.ttf" : bold ? "DejaVuSans-Bold.ttf" : "DejaVuSans.ttf");
-  if (!face && !title) face = loadFace("DejaVuSans.ttf");
-  if (!face) face = loadFace("DejaVuSans-Bold.ttf");
-  if (!face) return false;
-  FT_Set_Pixel_Sizes(face, 0, (FT_UInt)std::max(1L, std::lround(px)));
-  meta.assign(2 + cps.size() * 5, 0);
-  meta[0] = (int)std::ceil(face->size->metrics.ascender / 64.0);
-  meta[1] = (int)std::ceil(face->size->metrics.height / 64.0);
-  for (size_t i = 0; i < cps.size(); i++) {
-    int* m = &meta[2 + i * 5];
-    if (cps[i] != ' ' && FT_Get_Char_Index(face, cps[i]) == 0) {
-      m[0] = -1;
-      continue;
-    }
-    if (FT_Load_Char(face, cps[i], FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT) != 0) {
-      m[0] = -1;
-      continue;
-    }
-    const FT_GlyphSlot g = face->glyph;
-    m[0] = (int)g->advance.x;  // (26.6: the advance x 64)
-    const int bw = (int)g->bitmap.width, bh = (int)g->bitmap.rows;
-    if (bw <= 0 || bh <= 0) continue;
-    const int w = bw + 2, h = bh + 2;  // (a pixel of room for the filtering each side, as on Android)
-    m[1] = g->bitmap_left - 1;
-    m[2] = -g->bitmap_top - 1;
-    m[3] = w;
-    m[4] = h;
-    const size_t at = bits.size();
-    bits.resize(at + (size_t)w * h, 0);
-    for (int y = 0; y < bh; y++)
-      for (int x = 0; x < bw; x++) bits[at + (size_t)(y + 1) * w + x + 1] = g->bitmap.buffer[y * g->bitmap.pitch + x];
-  }
-#else
   JNIEnv* env = (JNIEnv*)SDL_AndroidGetJNIEnv();
   jobject act = (jobject)SDL_AndroidGetActivity();
   if (!env || !act) return false;
@@ -770,7 +715,6 @@ bool GlesCanvas::buildFont(Font& f, float px, bool bold, bool title) {
   env->ExceptionClear();
   env->DeleteLocalRef(cls);
   env->DeleteLocalRef(act);
-#endif
   if (meta.empty()) return false;
   f.ascent = meta[0];
   f.lineH = meta[1];
@@ -917,8 +861,14 @@ bool Video::init(SDL_Window* window) {
     return false;
   }
   SDL_GL_MakeCurrent(window, (SDL_GLContext)gl_);
+  return build();
+}
+
+// Everything the video layer keeps in the graphics context: the game
+// picture's shader, its samplers, the canvas (with its fonts and images).
+bool Video::build() {
   SDL_GL_SetSwapInterval(1);
-  SDL_GL_GetDrawableSize(window, &w_, &h_);
+  SDL_GL_GetDrawableSize(window_, &w_, &h_);
   prog_ = link(kGameVS, kGameFS);
   if (!prog_) return false;
   const char* names[] = {"u_texP", "u_texL", "u_texSize", "u_outSize", "u_f0", "u_f1", "u_f2", "u_f3"};
@@ -936,6 +886,32 @@ bool Video::init(SDL_Window* window) {
   canvas_ = std::make_unique<GlesCanvas>(++epochs);
   if (!canvas_->create()) return false;
   return true;
+}
+
+// Android took the graphics context away while the app was in the background
+// and SDL made a new one (SDL_RENDER_DEVICE_RESET): every texture, shader and
+// buffer made in the old one is gone. They are forgotten, not deleted (their
+// names mean nothing in the new context), and made again. The canvas is a new
+// one (another epoch), so whatever drew on the old one makes its shapes and
+// images again. Without this the screen stayed black after returning to the
+// app on devices that drop the context.
+bool Video::recover() {
+  if (!window_) return false;
+  if (canvas_) canvas_->abandon();
+  canvas_.reset();
+  tex_ = prog_ = vao_ = samplers_[0] = samplers_[1] = 0;
+  texW_ = texH_ = 0;
+  SDL_GLContext current = SDL_GL_GetCurrentContext();
+  if (!current) {
+    current = SDL_GL_CreateContext(window_);
+    if (!current) {
+      logError(SDL_GetError());
+      return false;
+    }
+    SDL_GL_MakeCurrent(window_, current);
+  }
+  gl_ = current;
+  return build();
 }
 
 void Video::shutdown() {

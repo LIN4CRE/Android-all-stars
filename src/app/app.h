@@ -1,9 +1,17 @@
-// Super Mario All-Stars port: the application (launcher, game, menus,
-// achievements), the same on every platform. The platform's part (window,
-// main loop, video, sound, controllers) is in app_win.cpp (Windows) and
-// platform/android/app_android.cpp (Android).
+// SMAS Mobile: the application (hub, game, menus, saves, achievements).
+//
+// Everything here is platform-independent C++ and is built and tested on a
+// desktop host as well (tests/). The few things only Android can do (the
+// window and main loop, the system file pickers, vibration, the display's
+// safe area) are behind app/platform.h, implemented in
+// platform/android/app_android.cpp.
+//
+// The source is split by concern:
+//   app.cpp        the frame loop, input, layout, the in-game and settings menus
+//   app_hub.cpp    the hub, the game file (import and validation), Help, About
+//   app_saves.cpp  saved progress: battery saves, save states, the automatic
+//                  resume point, backups, Save Management
 #pragma once
-#include "app/updatecheck.h"
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -11,41 +19,41 @@
 #include <vector>
 
 #include "app/achstore.h"
+#include "app/backup.h"
 #include "app/canvas.h"
 #include "app/config.h"
-#include "app/launcher.h"
+#include "app/hub.h"
 #include "app/menu.h"
 #include "app/music.h"
+#include "app/romcheck.h"
+#include "app/savestore.h"
 #include "core/rewind.h"
 #include "core/snes.h"
 #include "game/smas.h"
-#ifdef _WIN32
-#include "app/audio.h"
-#include "app/input.h"
-#include "app/monitors.h"
-#include "app/video.h"
-#else
 #include "platform/android/audio_sdl.h"
 #include "platform/android/input_sdl.h"
 #include "platform/android/touch.h"
 #include "platform/android/video_gles.h"
-#endif
 
-extern const wchar_t* kAppTitle;
-extern const char* kAppVersion;
+extern const wchar_t* kAppTitle;      // L"SMAS Mobile"
+extern const wchar_t kLogFileName[];  // L"smas-mobile.log", in the app's folder on shared storage
+extern const char* kAppName;          // "SMAS Mobile"
+extern const char* kAppVersion;       // "1.0.0" (version.properties, through the build)
+extern const char* kPublisher;        // "LIN4CRE"
+extern const char* kUpstreamVersion;  // the open-source port this app is built on: "1.1.1"
+extern const char* kSourceUrl;
+extern const char* kReleasesUrl;
+extern const char* kUpstreamUrl;
+// "1.2.3" as 10203 (recorded in save files).
+uint32_t appVersionNumber();
 
 struct App {
-#ifdef _WIN32
-  HWND hwnd = nullptr;
-#endif
   bool running = true;
   bool focused = true;
   Config cfg;
-  std::wstring exeDir, configPath, saveDir, shotDir, romPath;
-  UpdateCheck updater;      // (a newer release on GitHub? see updatecheck.h)
-  std::string updateTag;    // the newer release's tag ("v1.2"), or empty
-  bool updateManual = false, updateStarted = false, updateTold = false;
-  std::wstring msuDir;     // MSU-1 music packs (see app/msupack.h); exeDir/msu unless the platform says
+  // The app's private folder and what is kept in it.
+  std::wstring exeDir, configPath, saveDir, shotDir, romDir, tmpDir, romPath, logPath;
+  std::wstring msuDir;     // MSU-1 music packs (see app/msupack.h)
   std::wstring msuLoaded;  // the pack the console runs with (empty: none)
   std::string msuStatus;   // what became of the chosen pack, for the Audio page
   std::wstring msuBase;    // its tracks' path without "-N.pcm" (empty: none in use)
@@ -56,48 +64,109 @@ struct App {
   Input input;
   Menu menu;
   MusicPlayer music;
-  // The launcher (see launcher.h): shown at start and after Return to
-  // Launcher; the game's console isn't run meanwhile.
-  Launcher launcher;
-  bool inLauncher = false;
-  GameId playing = GameId::SMB1;  // the game last started from it
+
+  // ---- the hub (app_hub.cpp) -------------------------------------------
+  Hub hub;
+  bool inHub = false;             // the hub shows; the game's console isn't run meanwhile
+  Hub::Action hubTap = Hub::kNone;  // (a tile tapped: see frameHub)
+  GameId playing = GameId::SMB1;  // the game last started
   bool menuHintShown = false;
-  std::vector<uint8_t> romData;
-  bool romExact = true;
-  double romPoll = 0;
-  std::wstring startGame;  // --game smb1|smbll|smb2|smb3: straight into it
-  bool blackFrame = false;  // this refresh is black (black frame insertion)
-  int hfrStep = 0;          // high frame rate without VSync: the pass within the frame
-  std::vector<uint32_t> hfrPrev;  // high frame rate, timed: the last frame's picture (shown for a moment near it)
-  bool hfrPrevOk = false;
-  int hfrPrevExt = 0;
-  bool vblankWaited = false;  // the last pass waited for a vertical blank (VSync)
-  static constexpr int kHfrMaxDrawn = 2;  // in-between pictures drawn with a frame, at most
-  double hfrT = -1;         // high frame rate: this refresh's moment, from the last frame (0) to this one (1); -1 off
-  int hfrSubFrames() const;  // in-between pictures per frame for this display (1: none)
-#ifdef _WIN32
-  std::vector<MonitorInfo> monitors;
-  RECT windowedRect{};
-  bool inSizeMove = false;
-#else
-  TouchControls touch;  // (on-screen controls: see platform/android/touch.h)
-  bool touchActive = true;  // touch is the input in use (else a controller or keys)
-  struct SDL_Window* window = nullptr;
-  bool pickingRom = false;
-  void pickRom();   // the system file picker, the file copied into the app (see SmasActivity)
+  void frameHub(double dt);
+  void refreshHub();              // the hub's lines, from the app's state
+  void hubAction(Hub::Action a);
+  void launchGame(GameId g);
+  void returnToHub();
+  void requestQuit();             // everything saved, then the app closes
+  static GameId gameOfIndex(int i);  // 0-3 the four games, 4 the cartridge's own title screen
+  static int indexOfGame(GameId g);
+  static ColorF gameAccent(GameId g);
+
+  // ---- the game file (app_hub.cpp) -------------------------------------
+  RomCheck romInfo;               // what the game file in use is (see app/romcheck.h)
+  bool loadRom();                 // the stored game file into a new console
+  bool findRom(std::wstring* out);
+  void romReady();
+  void applyMsu(std::vector<uint8_t>& rom);
+  void reloadForMsu();
+  void removeGameFile();
+  // A file the player chose, already copied to tmpDir: checked, and only if it
+  // is the game moved into place. Says what happened either way.
+  void importGameFile(const std::wstring& candidate, const std::string& shownName);
+
+  // ---- system pickers (through app/platform.h) -------------------------
+  enum class Picking { None, GameFile, Backup, Export, LogExport } picking = Picking::None;
+  void pickGameFile();
+  void pickBackup();
+  void exportBackup();
+  void exportLog();   // a copy of the log file, saved where the player chooses
   void pollPick();
-  void pickArt(int card);  // a cover (card 0-4) or the background (-1) chosen with the system picker (Android)
-  void pollArtPick();
-  bool pickingArt = false;
-  void touchFrame();  // taps and drags on the launcher and menus, the on-screen pad's buttons
-#endif
-  Launcher::Action launcherTap = Launcher::kNone;  // (a card or button tapped or clicked: see frameLauncher)
-  bool mouseShown = false;  // (Windows: the mouse moved on the launcher, its pointer shown till a key)
-  int lastWantExt = 0;  // widescreen margin chosen by the last usable layout
-  bool pendingDisplayMode = false;  // re-apply the display mode from the main loop
+  BackupSummary exportSummary;
+
+  // ---- saved progress (app_saves.cpp) ----------------------------------
+  BatteryStore battery;           // the games' own save files
+  AsyncWriter writer;             // (the resume point, written off the main thread)
+  bool restorePointKept = false;  // this session's restore point was made
+  bool sramFailed = false;        // the last save of game progress failed (reported once)
+  double sramTimer = 0;
+  int stateSlot = 1;
+  int pendingSave = -1;           // (a save asked for in a co-op turn's middle: see saveState)
+  std::vector<uint8_t> undoState; // the moment before the last Load State (Undo Load State)
+  int undoSlot = 0;
+  // The automatic resume point ("Continue Playing").
+  bool haveResume = false;
+  seal::Info resumeInfo;
+  double resumeTimer = 0;
+  uint32_t resumeGeneration = 0;
+  void loadSram();
+  void saveSram();
+  void saveState(int slot);
+  void loadState(int slot);
+  void undoLoadState();
+  // Loads a state into the console, keeping the games' own save files as they
+  // are now (a state never takes back progress the game has saved).
+  bool applyState(const std::vector<uint8_t>& st);
+  void saveResume(bool now);      // now: on this thread, before returning (the app is going away)
+  void checkResume();             // is there a point to continue from?
+  void continueGame();
+  void dropResume();
+  void restoreBackupFile(const std::wstring& file, const std::string& shownName);
+  std::wstring statePath(int slot) const;
+  std::wstring resumePath() const;
+  std::string whenText(long long t) const;  // "today, 18:30" / "12 Nov, 18:30"
+
+  // ---- lifecycle (called by the platform's main loop) ------------------
+  void onBackground();   // the app is leaving the screen: everything is saved, the game pauses
+  void onForeground();
+  void onLowMemory();
+  void onTerminating();
+  void onDeviceReset();  // the graphics context was lost and made again
+  void onResized(int w, int h);
+
+  // ---- on-screen controls ----------------------------------------------
+  TouchControls touch;
+  bool touchActive = true;   // touch is the input in use (else a controller or keys)
+  float insets[4] = {0, 0, 0, 0};  // the display's safe area: left, top, right, bottom, in pixels
+  bool editingTouch = false; // the layout editor is open
+  bool editorFromGame = false;
+  unsigned exclusionKey = 0; // (the control rectangles last given to the system)
+  void touchFrame();
+  void openTouchEditor();
+  void closeTouchEditor();
+  void drawTouchEditor(Canvas* cv);
+  bool editorTap(float x, float y);
+  // The display's safe area and density (asked of the system at start, when the
+  // screen changes, and every two seconds: a phone turned the other way round
+  // moves its cutout without the screen's size changing).
+  void refreshInsets();
+  double screenTimer = 0;
+  bool touchShown() const;   // the on-screen controls are in use (and so the 4:3 picture, if chosen)
+
+  struct SDL_Window* window = nullptr;
+  int lastWantExt = 0;       // widescreen margin chosen by the last usable layout
   float menuAnim = 0;
   // input state
   uint16_t padState[2] = {0, 0};
+  uint16_t padSwallow[2] = {0, 0};  // buttons held when a menu closed: not the game's until let go
   bool prevAction[2][kActCount] = {};
   bool prevSelect[2] = {false, false};
   bool prevMenuBtn[2] = {false, false};
@@ -111,27 +180,18 @@ struct App {
     int mode = -1;        // kPace* in effect
     double hz = 60;       // display refresh
     int perFrame = 0;     // refreshes per game frame when locked (0 = not a whole number)
-    double vbResidual = 0;
     int vblanks = 0;      // refreshes since the last game frame (locked mode)
     double accum = 0;     // game time owed (unlocked vsync)
-    double deadline = 0;  // next frame time (timer-paced modes)
-    std::string cadence;  // refreshes per game frame, for the test log
-    // (display.pacing_log: refreshes per pass seen, 0 1 2 3+; the passes' spacing)
-    int vbSeen[4] = {}, logPasses = 0, logFrames = 0;
-    double dtLo = 1e9, dtHi = 0, logAt = 0;
-    int offBeatCount = 0;           // passes in a row whose wait wasn't a whole number of refreshes
-    bool offBeatLogged = false;
-    double sumReal = 0, sumCounted = 0;  // (this window's time gone by, and its refreshes counted)
-    int nWin = 0;
-    bool clockMode = false;         // game time from the clock: the refreshes counted drifted
-    unsigned logPresents = 0, logRefreshes = 0;
   } pacing;
   double fpsTimer = 0;
   int fpsFrames = 0;
   double fps = 0;
-  int stateSlot = 1;
-  double sramTimer = 0;
-  bool sramFailed = false;  // the last save of game progress failed (reported once)
+  // (for the log: how the last stretch of play ran)
+  struct Perf {
+    double window = 0;
+    int passes = 0, frames = 0, slow = 0;
+    double worstMs = 0, emuMs = 0;
+  } perf;
   std::vector<int16_t> audioBuf;
   bool fastForward = false;
   // Rewind: a snapshot every other frame (see stepRewind).
@@ -142,103 +202,25 @@ struct App {
   bool stepRewind(int steps);
   void endRewind();
   void restoreSnapshot(const std::vector<uint8_t>& st);
-  // automated test mode (--test-shot)
-  struct Test {
-    bool on = false;
-    std::wstring shot, state, menuPage, config;
-    int frames = 120;
-    int w = 1920, h = 1080;
-    std::string input;
-    double runSeconds = 0;  // --test-run: drive the real main loop for N seconds
-    double loseDeviceAt = 0;  // --test-device-lost: pretend the GPU was reset at N seconds
-    int displayMode = -1;   // --test-display 0/1/2 (default windowed)
-    int sync = -1;          // --test-sync 0/1/2
-  } test;
-  void runTest();
-#ifdef _WIN32
-  // The trailer's recording mode (--autotest <dir> <script>): see autotest_win.cpp.
-  struct AtStep {
-    int pass = 0;
-    std::string cmd, arg;
-  };
-  struct Autotest {
-    bool on = false;
-    std::wstring dir;
-    std::vector<AtStep> steps;
-    size_t pos = 0;
-    int pass = 0;
-    int subs = 1;                  // pictures per game frame (hfr)
-    std::vector<uint16_t> pads;    // the two controllers per game frame (pads)
-    size_t padPos = 0;
-    FILE* vid = nullptr;           // ffmpeg's input (record)
-    FILE* pcm = nullptr;
-    std::wstring recName;
-    int recFrames = 0, recW = 0, recH = 0;
-    int64_t recSamples = 0;
-    std::string shot;
-  } at;
-  bool atLoad(const std::wstring& path);
-  void atSet(const std::string& kv);
-  void atRunSteps();
-  void atStartRec(const std::string& name);
-  void atStopRec();
-  void atRecordPicture();
-  void atRecordAudio(const int16_t* s, size_t frames);
-  void runAutotest();
-#endif
 
   // ---------------------------------------------------------------------
-#ifdef _WIN32
-  bool init(HINSTANCE inst);
-#else
-  bool init();
-#endif
-  void shutdown();
-  void run();
+  bool init();      // (platform)
+  void shutdown();  // (platform)
+  void run();       // (platform)
+  // After the platform has made the window, video, audio and input: folders,
+  // settings, the game file, saves, the hub. Shared with the host tests.
+  void start(const std::wstring& dataDir, const std::wstring& sharedDir);
+  void stop();      // everything saved (before the platform tears down)
   void frame(double dt, int gameFrames);
   void render();
-  bool loadRom();
-  bool findRom(std::wstring* out);
-  void romReady();                    // a ROM was loaded: the console, music and previews
-  void pollRom(double dt);            // looks for the ROM again while it is missing
-  void launchGame(GameId g);
-  void returnToLauncher();
-  void applyMsu(std::vector<uint8_t>& rom);  // (loadRom: the chosen pack's patch and chip)
-  void reloadForMsu();
-  void checkForUpdate(bool manual);  // (manual: Check Now, which says what it found)
-  void updateTick();                 // (each pass: a finished check's result)
-  void applyUpdateTag(const std::string& tag);
-  std::string updateVersion() const {  // ("v1.2": "1.2")
-    return updateTag.size() > 1 && (updateTag[0] == 'v' || updateTag[0] == 'V') ? updateTag.substr(1) : updateTag;
-  }                        // the chosen pack changed: the ROM again, outside a game
-  void frameLauncher(double dt, int gameFrames);
-  std::string blackFramesNote() const;
-  void applyDisplayMode();
   void applyConfig();
-  void applyLauncherArt(bool reload = false);  // the covers and background (see Launcher::setArt)
-  // The slang shader preset in cfg.slangPreset loaded (or dropped) if it
-  // isn't what the video layer has; force after the device was recreated.
-#ifdef _WIN32
-  void applySlang(bool force = false);
-  std::wstring slangLoaded;  // the preset loaded now (full path; empty: none)
-  std::shared_ptr<MenuPage> pageSlang();
-#endif
   void computeLayout(IRect* dest, int* ext, int* srcW);
   void updateInput(double dt);
   void readPlayer(int p, uint16_t* snesPad, double dt);
   MenuInput menuInput();
   void openMenu();
-  void saveSram();
-  void loadSram();
-  void saveState(int slot);
-  int pendingSave = -1;  // (a save asked for in a co-op turn's middle: see saveState)
-  void loadState(int slot);
-#ifdef _WIN32
-  void recoverVideo(double now);
-  double lastVideoRecovery = -1e9;
-#endif
+  void pushPage(std::shared_ptr<MenuPage> p);
   void screenshot();
-  std::wstring statePath(int slot) const;
   // menu pages
   std::shared_ptr<MenuPage> pageMain();
   std::shared_ptr<MenuPage> pageDisplay();
@@ -246,14 +228,29 @@ struct App {
   std::shared_ptr<MenuPage> pageColor();
   std::shared_ptr<MenuPage> pageAudio();
   std::shared_ptr<MenuPage> pageControls();
+  std::shared_ptr<MenuPage> pageTouch();
   std::shared_ptr<MenuPage> pageBindings(int player, bool pad);
   std::shared_ptr<MenuPage> pageCheats();
   std::shared_ptr<MenuPage> pageLevelSelect();
-  std::shared_ptr<MenuPage> pageCredits();
   std::shared_ptr<MenuPage> pageSoundSelect();
   std::shared_ptr<MenuPage> pageMusicPlayer();
   std::shared_ptr<MenuPage> pageOptions();
   std::shared_ptr<MenuPage> pageAchievements();
+  // (app_hub.cpp)
+  std::shared_ptr<MenuPage> pageGameFile();
+  std::shared_ptr<MenuPage> pageImportResult(const RomCheck& rc, const std::string& shownName, bool imported);
+  std::shared_ptr<MenuPage> pageHelp();
+  std::shared_ptr<MenuPage> pageHelpTopic(int topic);
+  std::shared_ptr<MenuPage> pageAbout();
+  std::shared_ptr<MenuPage> pageLicences();
+  std::shared_ptr<MenuPage> pageUpdates();
+  std::shared_ptr<MenuPage> pageText(const std::string& title, const std::string& subtitle, const std::string& text);
+  // (app_saves.cpp)
+  std::shared_ptr<MenuPage> pageSaves();
+  std::shared_ptr<MenuPage> pageRestorePoints();
+  std::shared_ptr<MenuPage> pageStateSlots();
+  std::shared_ptr<MenuPage> pageStateSlot(int slot);
+  std::string slotText(int slot) const;  // "12 Nov, 18:30" or "Empty"
   std::string bindingsText(int action) const;  // "F5 / LB": what does it (player 1)
   // achievements (see game/achievements.h)
   AchievementStore achStore;
@@ -273,15 +270,23 @@ struct App {
   void updateBind(double dt);
 };
 
-
 extern App* g_app;
 extern FILE* g_log;
-void logf(const char* fmt, ...);
+void logf(const char* fmt, ...)
+#if defined(__GNUC__)
+    __attribute__((format(printf, 1, 2)))
+#endif
+    ;
 std::string narrow(const std::wstring& w);
 bool readAll(const std::wstring& path, std::vector<uint8_t>& out);
 bool writeAll(const std::wstring& path, const void* d, size_t n);
-// Whether the data is the Super Mario All-Stars ROM (headered or not); `exact`:
-// the USA dump the port is tuned for.
-bool isSmasRom(const std::vector<uint8_t>& d, bool* exact);
 // The pacing modes (see App::run).
 enum { kPaceVsync = 0, kPaceTimer = 1 };
+
+// Buttons that were held when a menu closed stay out of the game until they
+// are let go: the press that chose "Save State" or "Resume" is not also a
+// jump (upstream issue #30). `swallow` is the set still being held back.
+inline uint16_t swallowHeld(uint16_t pad, uint16_t* swallow) {
+  *swallow &= pad;
+  return (uint16_t)(pad & ~*swallow);
+}

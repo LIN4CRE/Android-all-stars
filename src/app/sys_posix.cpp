@@ -1,7 +1,11 @@
-// sys.h on POSIX systems (Android): paths are UTF-8 underneath.
+// sys.h on POSIX systems (Android, and the tests on a computer): paths are UTF-8 underneath.
 #include "app/sys.h"
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include "app/canvas.h"
@@ -66,6 +70,31 @@ bool fileModified(const std::wstring& path, int* day, int* month, int* hour, int
 
 void makeDir(const std::wstring& path) { mkdir(narrowUtf8(path).c_str(), 0755); }
 
+long long fileSize(const std::wstring& path) {
+  struct stat st;
+  if (stat(narrowUtf8(path).c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+  return (long long)st.st_size;
+}
+
+long long fileTime(const std::wstring& path) {
+  struct stat st;
+  if (stat(narrowUtf8(path).c_str(), &st) != 0) return 0;
+  return (long long)st.st_mtime;
+}
+
+bool removeFile(const std::wstring& path) { return unlink(narrowUtf8(path).c_str()) == 0 || errno == ENOENT; }
+
+bool renameFile(const std::wstring& from, const std::wstring& to) {
+  return std::rename(narrowUtf8(from).c_str(), narrowUtf8(to).c_str()) == 0;
+}
+
+bool diskFree(const std::wstring& dir, unsigned long long* bytes) {
+  struct statvfs sv;
+  if (statvfs(narrowUtf8(dir).c_str(), &sv) != 0) return false;
+  *bytes = (unsigned long long)sv.f_bavail * (unsigned long long)sv.f_frsize;
+  return true;
+}
+
 bool listFiles(const std::wstring& dir, std::vector<std::wstring>& names) {
   DIR* d = opendir(narrowUtf8(dir).c_str());
   if (!d) return false;
@@ -92,11 +121,15 @@ bool listDirs(const std::wstring& dir, std::vector<std::wstring>& names) {
   return true;
 }
 
-std::string timeText(const char* fmt) {
-  time_t t = time(nullptr);
+long long timeNow() { return (long long)time(nullptr); }
+
+std::string timeTextAt(long long when, const char* fmt) {
+  time_t t = (time_t)when;
   tm lt;
   localtime_r(&t, &lt);
   char buf[64];
-  strftime(buf, sizeof buf, fmt, &lt);
+  if (strftime(buf, sizeof buf, fmt, &lt) == 0) buf[0] = 0;
   return buf;
 }
+
+std::string timeText(const char* fmt) { return timeTextAt(timeNow(), fmt); }

@@ -12,18 +12,8 @@ bool Audio::init(int latencyMs) {
   want.freq = 48000;
   want.format = AUDIO_S16SYS;
   want.channels = 2;
-#ifdef __ANDROID__
   want.samples = 512;
-#else
-  // (Linux desktops and the Steam Deck: PipeWire / PulseAudio take bigger
-  // chunks; with 512 the queue ran dry now and then, a crackle)
-  want.samples = 1024;
-#endif
-#ifdef __ANDROID__
   dev_ = SDL_OpenAudioDevice(nullptr, 0, &want, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
-#else
-  dev_ = SDL_OpenAudioDevice(nullptr, 0, &want, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE | SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
-#endif
   if (!dev_) return false;
   rate_ = have.freq > 0 ? have.freq : 48000;
   deviceFrames_ = have.samples > 0 ? have.samples : want.samples;

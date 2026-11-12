@@ -1,7 +1,15 @@
-// Controllers and keyboards on Android, the same model as Windows' app/input.h:
-// keys by Windows virtual-key code (the settings file's), controllers through
-// SDL's GameController API in the standard layout (buttons 0-15 = A B X Y LB
-// RB Back Start LS RS Up Down Left Right LT RT, axes 0-3 = LX LY RX RY).
+// Controllers and keyboards on Android: keys by virtual-key code (the settings
+// file's), controllers in the standard layout (buttons 0-15 = A B X Y LB RB
+// Back Start LS RS Up Down Left Right LT RT, axes 0-3 = LX LY RX RY).
+//
+// A controller reaches the app one of three ways, tried in this order:
+//   1. SDL's GameController API: a pad SDL knows the layout of;
+//   2. SDL's Joystick API: a pad SDL sees but has no layout for (its buttons
+//      as they come; they can be assigned in Controls > Joypad);
+//   3. "basic mode": a pad Android reports only as key presses, which SDL
+//      does not treat as a controller at all (see SmasActivity.dispatchKeyEvent).
+// Without 2 and 3 such pads showed as "not connected" and only two of their
+// buttons did anything (upstream issue #7).
 #pragma once
 #include <cstdint>
 #include <string>
@@ -13,12 +21,19 @@ constexpr int kPadButtons = 48;
 struct PadState {
   bool connected = false;
   bool xinput = false;
+  enum Kind : uint8_t { Standard, Generic, Basic } kind = Standard;  // (which of the three ways above)
   std::wstring name;
   bool buttons[kPadButtons] = {};
   float axes[6] = {};
 };
 
 struct _SDL_GameController;
+struct _SDL_Joystick;
+
+// "Basic mode" (thread-safe: called from Android's UI thread): the buttons
+// held, as bits in the standard layout, and the stick or hat, -1..1 each.
+void inputBasicPad(uint32_t buttons, float x, float y);
+void inputBasicPadName(const char* name);
 
 class Input {
 public:
@@ -35,6 +50,7 @@ public:
   int padCount() const { return (int)pads_.size(); }
   const PadState* pad(int i) const { return (i >= 0 && i < (int)pads_.size()) ? &pads_[i] : nullptr; }
   bool anyPad() const;  // a controller is connected
+  bool anyPadActivity() const;  // ... and a button is down or a stick is pushed
 
   bool active(const Binding& b, int padIdx, float deadzone) const;
   bool capture(Binding* out, bool pads, int padIdx, float deadzone);
@@ -47,7 +63,10 @@ private:
   std::vector<PadState> pads_;
   std::vector<PadState> prevPads_;
   std::vector<_SDL_GameController*> ctl_;
+  std::vector<_SDL_Joystick*> joy_;  // (a slot has one or the other, or neither)
+  int basicSlot_ = -1;
   bool rescan_ = true;
+  int newSlot();
   void scan();
 };
 

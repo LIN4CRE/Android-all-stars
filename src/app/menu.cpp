@@ -347,6 +347,139 @@ void Menu::confirm(const std::string& question, std::function<void()> yes, const
   push(p);
 }
 
+// The same measures as draw(): the panel's inner width, the rows' text size.
+std::vector<std::string> Menu::wrapText(const std::string& text, bool wide) const {
+  std::vector<std::string> lines;
+  float room = 0, size = 0;
+  if (cv_ && lastW_ > 0 && lastH_ > 0) {
+    const Metrics m = metrics(lastW_, lastH_, wide);
+    room = (m.panel.right - m.panel.left - m.pad * 2) * 0.96f;
+    size = m.sizeBody;
+  }
+  const size_t maxChars = wide ? 78 : 58;  // (before the first draw: by length)
+  auto fits = [&](const std::string& l) {
+    if (room > 0) return cv_->measure(widen(l), size, kWeightNormal) <= room;
+    return l.size() <= maxChars;
+  };
+  size_t at = 0;
+  std::string line;
+  while (at <= text.size()) {
+    const size_t nl = text.find('\n', at);
+    const std::string para = text.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+    at = nl == std::string::npos ? text.size() + 1 : nl + 1;
+    size_t p = 0;
+    line.clear();
+    while (p < para.size()) {
+      size_t sp = para.find(' ', p);
+      const std::string word = para.substr(p, sp == std::string::npos ? std::string::npos : sp - p);
+      p = sp == std::string::npos ? para.size() : sp + 1;
+      if (word.empty()) continue;
+      const std::string tryLine = line.empty() ? word : line + " " + word;
+      if (!line.empty() && !fits(tryLine)) {
+        lines.push_back(line);
+        line = word;
+      } else {
+        line = tryLine;
+      }
+    }
+    lines.push_back(line);  // (an empty paragraph: a blank row)
+  }
+  return lines;
+}
+
+void Menu::addText(MenuPage& page, const std::string& text) const {
+  for (const std::string& l : wrapText(text, page.wide)) {
+    if (l.empty()) page.items.push_back(MenuItem::separator());
+    else page.items.push_back(MenuItem::info(l));
+  }
+}
+
+void Menu::setSafeArea(float left, float top, float right, float bottom) {
+  safe_[0] = std::max(0.0f, left);
+  safe_[1] = std::max(0.0f, top);
+  safe_[2] = std::max(0.0f, right);
+  safe_[3] = std::max(0.0f, bottom);
+}
+
+// The measures every page is drawn with. On a monitor or TV everything is a
+// fraction of the screen's height (text scale 1). On a phone that would make
+// the text a millimetre and a half tall: the app passes a text scale from the
+// display's density, and the panel takes more of the screen to hold it.
+Menu::Metrics Menu::metrics(int w, int h, bool wide) const {
+  Metrics m;
+  const float W = (float)w, H = (float)h;
+  const float k = std::clamp(textScale, 1.0f, 1.75f), base = std::max(H / 1080.0f, 0.55f);
+  m.s = base * k;
+  m.titleScale = base * std::min(k, 1.3f);
+  float l = safe_[0], t = safe_[1], r = W - safe_[2], b = H - safe_[3];
+  // (insets that leave less than half the screen make no sense: the whole screen then)
+  if (r - l < W * 0.5f) l = 0, r = W;
+  if (b - t < H * 0.5f) t = 0, b = H;
+  m.safe = rectF(l, t, r, b);
+  const float sw = r - l, sh = b - t;
+  const float pw = std::min({W * (wide ? 0.8f : 0.62f) * k, H * (wide ? 1.5f : 1.15f) * k, sw - 32 * base});
+  const float ph = std::min(sh * 0.96f, H * 0.84f * (1.0f + (k - 1.0f) * 0.35f));
+  m.panel = rectF(l + (sw - pw) * 0.5f, t + (sh - ph) * 0.5f, l + (sw + pw) * 0.5f, t + (sh + ph) * 0.5f);
+  m.pad = H * 0.035f;
+  m.sizeBody = 26 * m.s;
+  m.sizeSmall = 19 * m.s;
+  m.sizeHelp = 22 * m.s;
+  m.rowText = m.sizeBody * kLine * 1.32f;
+  m.rowTouch = std::max(m.rowText, touchUi ? minRow : 0.0f);
+  return m;
+}
+
+// Rows that can be chosen are tall enough for a finger; lines of text and
+// headings keep the text's own height (a page of explanation stays compact).
+float Menu::rowHeight(const MenuItem& it) const {
+  return it.kind == MenuItem::Label || it.kind == MenuItem::Separator ? rowText_ : rowTouch_;
+}
+
+std::vector<float> Menu::rowTops(const MenuPage& p) const {
+  std::vector<float> top(p.items.size() + 1, 0.0f);
+  for (size_t i = 0; i < p.items.size(); i++) top[i + 1] = top[i] + rowHeight(p.items[i]);
+  return top;
+}
+
+void Menu::makeScrollable(MenuPage& page) {
+  page.freeScroll = true;
+  page.scroll = 0;
+  page.inputCustom = [](Menu& m, const MenuInput& e) {
+    MenuPage* pg = m.top();
+    if (!pg) return false;
+    const int n = (int)pg->items.size();
+    const std::vector<float> top = m.rowTops(*pg);
+    const float view = std::max(1.0f, m.listRect_.bottom - m.listRect_.top), slack = m.rowText_ * 0.5f;
+    const float maxScroll = std::max(0.0f, top[n] - view);
+    auto inView = [&](int row) { return top[row] >= pg->scroll - slack && top[row + 1] <= pg->scroll + view + slack; };
+    if (e.confirm && pg->sel >= 0 && pg->sel < n && !inView(pg->sel)) {
+      // (the chosen action is out of sight: shown first, used on the next press)
+      pg->freeScroll = true;
+      pg->scroll = std::clamp(top[pg->sel] - view * 0.5f, 0.0f, maxScroll);
+      return true;
+    }
+    if (!e.up && !e.down) return false;
+    const int dir = e.down ? 1 : -1;
+    int next = -1;
+    for (int i = pg->sel + dir; i >= 0 && i < n; i += dir)
+      if (m.selectable(pg->items[i])) {
+        next = i;
+        break;
+      }
+    pg->freeScroll = true;
+    if (next >= 0 && inView(next) && pg->sel >= 0 && pg->sel < n && inView(pg->sel)) {
+      pg->sel = next;
+      return true;
+    }
+    const float to = std::clamp(pg->scroll + (float)dir * m.rowText_ * 3.0f, 0.0f, maxScroll);
+    if (to == pg->scroll || (next >= 0 && inView(next))) {
+      if (next >= 0) pg->sel = next;
+    }
+    pg->scroll = to;
+    return true;
+  };
+}
+
 bool Menu::selectable(const MenuItem& it) const {
   if (it.kind == MenuItem::Label || it.kind == MenuItem::Separator) return false;
   if (it.enabled && !it.enabled()) return false;
@@ -480,22 +613,28 @@ void Menu::notify(const std::string& text, float seconds, bool hint) {
 
 void Menu::achievement(const std::string& name, const std::string& desc) { banners_.push_back({name, desc, 0.0f}); }
 
-// In play: top right, below SMB1's HUD rows (scanlines 16-31, so from about
-// 15.5% of the height) and the FPS counter, stacking down. With the menu open
-// the top holds titles, so toasts sit bottom centre over the key hints.
+// Notes that come and go. On a touch screen: bottom centre, clear of the
+// on-screen controls (which are at the sides) and inside the safe area.
+// Otherwise, in play: top right, below SMB1's HUD rows (scanlines 16-31, so
+// from about 15.5% of the height) and the FPS counter, stacking down; with the
+// menu open the top holds titles, so they sit bottom centre over the key hints.
 void Menu::drawToasts(int w, int h, float s) {
-  bool bottom = open();
-  float size = bottom ? 19 * s : 24 * s;
-  float lh = size * kLine, th = lh * 1.5f;
-  float y = bottom ? h - th - h * 0.012f : std::max(64 * s, h * 0.155f);
+  const Metrics m = metrics(w, h, false);
+  const bool bottom = open() || touchUi;
+  const float size0 = touchUi ? 22 * s : bottom ? 19 * s : 24 * s;
+  const float lh = size0 * kLine, th = lh * 1.5f;
+  const float sl = m.safe.left, sr = m.safe.right, room = (sr - sl) * 0.9f - h * 0.05f;
+  float y = bottom ? m.safe.bottom - th - h * 0.012f : std::max(m.safe.top + 64 * s, h * 0.155f);
   for (size_t i = 0; i < toasts_.size(); i++) {
     const Toast& t = toasts_[bottom ? toasts_.size() - 1 - i : i];  // newest nearest the edge
     float a = std::min(1.0f, t.time * 3.0f) * std::min(1.0f, (t.total - t.time) * 6.0f + 0.2f);
     std::wstring ws = widen(t.text);
-    float tw = std::min(measure(ws, size, false), w * 0.8f);
+    // (a long one shrinks to fit rather than running off the screen)
+    const float full = measure(ws, size0, false), size = size0 * std::min(1.0f, room / std::max(1.0f, full));
+    const float tw = std::min(full, room);
     float bw = tw + h * 0.05f;
-    RectF r = bottom ? rectF((w - bw) * 0.5f, y, (w + bw) * 0.5f, y + th)
-                           : rectF(w - bw - 16 * s, y, w - 16 * s, y + th);
+    RectF r = bottom ? rectF((sl + sr - bw) * 0.5f, y, (sl + sr + bw) * 0.5f, y + th)
+                           : rectF(sr - bw - 16 * s, y, sr - 16 * s, y + th);
     const Look& L = kLooks[style];
     const float rr = style == kRetro ? 0.0f : th * 0.3f;
     roundRect(r, rr, rgb(L.toastBg, 0.94f * a));
@@ -521,12 +660,14 @@ void Menu::drawBanner(int w, int h, float s) {
   float ls = ss * kLine, lb = sb * kLine, pad = ls * 0.55f;
   float textH = ls + lb + (desc.empty() ? 0.0f : ls);
   float icon = textH * 0.78f;
-  float maxTw = w * 0.86f - icon - pad * 3;
+  const Metrics m = metrics(w, h, false);
+  const float sl = m.safe.left, sr = m.safe.right;
+  float maxTw = (sr - sl) * 0.86f - icon - pad * 3;
   float nameS = std::min(1.0f, maxTw / std::max(1.0f, measure(name, sb, true)));
   float descS = std::min(1.0f, maxTw / std::max(1.0f, measure(desc, ss, false)));
   float tw = std::max({measure(head, ss, false), measure(name, sb, true) * nameS, measure(desc, ss, false) * descS});
   float bw = icon + tw + pad * 3, bh = textH + pad * 1.6f;
-  RectF r = rectF((w - bw) * 0.5f, h * 0.025f - (1 - slide) * (bh + h * 0.025f), 0, 0);
+  RectF r = rectF((sl + sr - bw) * 0.5f, m.safe.top + h * 0.025f - (1 - slide) * (bh + h * 0.025f + m.safe.top), 0, 0);
   r.right = r.left + bw;
   r.bottom = r.top + bh;
   const bool story = style == kStorybook, retro = style == kRetro;
@@ -567,15 +708,19 @@ void Menu::drawStar(float cx, float cy, float r, ColorF fill, ColorF edge, float
   cv_->strokePolygon(pts, 10, edgeW, edge);
 }
 
+// The frame rate and what the emulation is doing (rewinding...): two small
+// cards at the top, either side of the middle (the top corners belong to the
+// on-screen controls), inside the safe area.
 void Menu::drawOsd(int w, int h, const std::string& fps, const std::string& status) {
   if (!cv_) return;
-  float s = std::max(h / 1080.0f, 0.55f);
+  const Metrics m = metrics(w, h, false);
+  const float s = m.s, mid = (m.safe.left + m.safe.right) * 0.5f, top = m.safe.top + 12 * s, ch = 36 * s, gap = 8 * s;
   auto card = [&](RectF r, const std::string& t, ColorF c) {
     roundRect(r, (r.bottom - r.top) * 0.3f, rgb(0x181C26, 0.85f));
     text(widen(t), r, 20 * s, true, c, kAlignCenter);
   };
-  if (!status.empty()) card(rectF(16 * s, 16 * s, 236 * s, 52 * s), status, rgb(0xFFD866));
-  if (!fps.empty()) card(rectF(w - 196 * s, 16 * s, w - 16 * s, 52 * s), fps, rgb(0x9BE59B));
+  if (!status.empty()) card(rectF(mid - gap - 220 * s, top, mid - gap, top + ch), status, rgb(0xFFD866));
+  if (!fps.empty()) card(rectF(mid + gap, top, mid + gap + 180 * s, top + ch), fps, rgb(0x9BE59B));
   drawToasts(w, h, s);
   drawBanner(w, h, s);
 }
@@ -583,12 +728,17 @@ void Menu::drawOsd(int w, int h, const std::string& fps, const std::string& stat
 void Menu::draw(int w, int h, float anim) {
   MenuPage* p = top();
   if (!p || !cv_) return;
-  scale_ = std::max(h / 1080.0f, 0.55f);
+  lastW_ = w;
+  lastH_ = h;
+  const bool wide = p->wide || p->listFraction < 0.999f;
+  const Metrics mt = metrics(w, h, wide);
+  scale_ = mt.s;
   const float s = scale_, W = (float)w, H = (float)h;
   const float a = std::clamp(anim, 0.0f, 1.0f);
   const Look& L = kLooks[std::clamp(style, 0, kStyleCount - 1)];
   const bool story = style == kStorybook, retro = style == kRetro, themed = style == kThemedDark;
-  const float sizeTitle = (story ? 56 : retro ? 44 : themed ? 54 : 48) * s, sizeBody = 26 * s, sizeSmall = 19 * s;
+  const float sizeTitle = (story ? 56 : retro ? 44 : themed ? 54 : 48) * mt.titleScale, sizeBody = mt.sizeBody,
+              sizeSmall = mt.sizeSmall;
   const float lhTitle = sizeTitle * kLine, lhBody = sizeBody * kLine, lhSmall = sizeSmall * kLine;
   const float ink = std::max(2.0f, H / 300.0f);  // (Storybook's outline width)
 
@@ -597,13 +747,11 @@ void Menu::draw(int w, int h, float anim) {
   else cv_->fillRect(rectF(0, 0, W, H), colorF(0.02f, 0.027f, 0.047f, (retro ? 0.8f : 0.6f) * a));
 
   // The panel
-  const bool wide = p->wide || p->listFraction < 0.999f;
-  float pw = std::min({W * (wide ? 0.8f : 0.62f), H * (wide ? 1.5f : 1.15f), W - 32 * s});
-  float ph = H * 0.84f;
-  RectF panel = rectF((W - pw) * 0.5f, (H - ph) * 0.5f + (1 - a) * 24 * s, 0, 0);
+  const float pw = mt.panel.right - mt.panel.left, ph = mt.panel.bottom - mt.panel.top;
+  RectF panel = rectF(mt.panel.left, mt.panel.top + (1 - a) * 24 * s, 0, 0);
   panel.right = panel.left + pw;
   panel.bottom = panel.top + ph;
-  const float rad = retro ? 0.0f : story ? H * 0.03f : H * 0.018f, pad = H * 0.035f;
+  const float rad = retro ? 0.0f : story ? H * 0.03f : H * 0.018f, pad = mt.pad;
   if (story) {
     // a cream card, a thick dark outline and a solid shadow below right
     roundRect(rectF(panel.left + ink * 2.5f, panel.top + ink * 3.5f, panel.right + ink * 2.5f, panel.bottom + ink * 3.5f),
@@ -653,7 +801,7 @@ void Menu::draw(int w, int h, float anim) {
   closeHit_ = RectF{};
   if (touchUi) {
     // (top right: back, or out of the menu)
-    const float cs = lhTitle * 0.9f;
+    const float cs = std::max(lhTitle * 0.9f, std::min(minRow, lhTitle * 1.5f));  // (big enough for a finger)
     closeHit_ = rectF(panel.right - pad - cs, y + (lhTitle - cs) * 0.5f, panel.right - pad, y + (lhTitle + cs) * 0.5f);
     if (story) {
       roundRect(closeHit_, cs * 0.5f, rgb(0xFFD400, a));
@@ -697,35 +845,47 @@ void Menu::draw(int w, int h, float anim) {
   // The list (beside a custom panel on pages that have one)
   // (the footer: the selected row's description, wrapped onto up to three lines
   // at a readable size rather than shrunk onto one, then the keys)
-  const float sizeHelp = 22 * s, lhHelp = sizeHelp * kLine;
-  const float row = lhBody * 1.32f, footerH = lhHelp * 3.1f + lhSmall * 1.75f + (retro ? H * 0.04f : 0.0f);
+  const float sizeHelp = mt.sizeHelp, lhHelp = sizeHelp * kLine;
+  // (the line of keys only while keys or a controller are in use)
+  const bool keysLine = showKeys || capturing;
+  const float footerH = lhHelp * 3.1f + (keysLine ? lhSmall * 1.75f : lhSmall * 0.5f) + (retro ? H * 0.04f : 0.0f);
   const float listTop = y, listBottom = panel.bottom - footerH - pad * 0.5f;
   const float listW = inner * p->listFraction;
   const float vx = tx + listW;  // values end here
-  const int visible = std::max(1, (int)((listBottom - listTop) / row));
   const int n = (int)p->items.size();
-  // Keep the selection in view (smooth scroll); on the last selectable row,
-  // also bring the read-only rows after it (e.g. Options' Hotkeys) into view.
+  // Rows that can be chosen are tall enough for a finger; lines of text and
+  // headings keep the text's own height.
+  rowText_ = mt.rowText;
+  rowTouch_ = mt.rowTouch;
+  listRect_ = rectF(panel.left + pad * 0.5f, listTop, vx + pad * 0.5f, listBottom);
+  const std::vector<float> tops = rowTops(*p);
+  const float viewH = std::max(1.0f, listBottom - listTop), maxScroll = std::max(0.0f, tops[n] - viewH);
+  // Keep the selection in view (smooth scroll), with the row before and after
+  // it where there is room; on the last selectable row, also bring the
+  // read-only rows after it (e.g. Options' Hotkeys) into view.
   float target = p->scroll;
   if (n > 0 && !p->freeScroll) {
-    if (p->sel < target + 1) target = (float)std::max(0, p->sel - 1);
-    if (p->sel > target + visible - 2) target = (float)(p->sel - visible + 2);
+    const int sel = std::clamp(p->sel, 0, n - 1);
+    const float from = tops[std::max(0, sel - 1)], to = tops[std::min(n, sel + 2)];
+    if (to > target + viewH) target = to - viewH;
+    if (from < target) target = from;
+    if (tops[sel + 1] > target + viewH) target = tops[sel + 1] - viewH;  // (too little room for all three: the row itself)
+    if (tops[sel] < target) target = tops[sel];
     int last = -1;
     for (int i = n - 1; i >= 0 && last < 0; i--)
       if (selectable(p->items[i])) last = i;
-    if (p->sel == last) target = std::max(target, std::min((float)p->sel, (float)(n - visible)));
+    if (sel == last) target = std::max(target, std::min(tops[sel], maxScroll));
   }
-  target = std::clamp(target, 0.0f, (float)std::max(0, n - visible));
+  target = std::clamp(target, 0.0f, maxScroll);
   p->scroll += (target - p->scroll) * 0.35f;
-  if (std::fabs(target - p->scroll) < 0.01f) p->scroll = target;
+  if (std::fabs(target - p->scroll) < 0.5f) p->scroll = target;
 
-  cv_->pushClip(rectF(panel.left, listTop - row * 0.1f, panel.right, listBottom + row * 0.1f));
+  cv_->pushClip(rectF(panel.left, listTop - rowText_ * 0.1f, panel.right, listBottom + rowText_ * 0.1f));
   rowHits_.clear();
-  rowH_ = row;
-  int first = (int)std::floor(p->scroll);
-  for (int i = first; i < n && i < first + visible + 1; i++) {
-    float ry = listTop + (i - p->scroll) * row;
-    if (ry < listTop - row * 0.5f || ry + row > listBottom + row * 0.5f) continue;
+  for (int i = 0; i < n; i++) {
+    const float ry = listTop + tops[i] - p->scroll, row = tops[i + 1] - tops[i];
+    if (ry + row < listTop - rowText_ * 0.1f) continue;
+    if (ry > listBottom + rowText_ * 0.1f) break;
     MenuItem& it = p->items[i];
     if (ry + row * 0.5f >= listTop && ry + row * 0.5f <= listBottom)
       rowHits_.push_back({rectF(panel.left + pad * 0.5f, ry, vx + pad * 0.5f, ry + row), i});
@@ -883,10 +1043,10 @@ void Menu::draw(int w, int h, float anim) {
   cv_->popClip();
 
   // scroll indicators
-  if (p->scroll > 0.05f)
+  if (p->scroll > 1.0f)
     text(L"↑", rectF(tx, listTop - lhSmall * 1.05f, tx + listW, listTop), sizeSmall, false, rgb(L.crumb, a),
          kAlignCenter);
-  if (p->scroll + visible < n - 0.05f)
+  if (p->scroll < maxScroll - 1.0f)
     text(L"↓", rectF(tx, listBottom - lhSmall * 0.3f, tx + listW, listBottom + lhSmall * 0.7f), sizeSmall,
          false, rgb(L.crumb, a), kAlignCenter);
 
@@ -924,11 +1084,13 @@ void Menu::draw(int w, int h, float anim) {
       ly += lhHelp * 0.95f;
     }
   }
-  std::wstring keys = !keysHint.empty() ? keysHint
-                     : confirmRight     ? L"↑↓ Select      ←→ Change      Enter / Ⓑ Confirm      Esc / Ⓐ Back"
-                                        : L"↑↓ Select      ←→ Change      Enter / Ⓐ Confirm      Esc / Ⓑ Back";
-  const float ky = panel.bottom - lhSmall * 1.45f - (retro ? H * 0.04f : 0.0f);
-  text(keys, rectF(tx, ky, panel.right - pad, ky + lhSmall), fit(keys, sizeSmall, false, inner), false, rgb(L.keys, a));
+  if (keysLine) {
+    std::wstring keys = !keysHint.empty() ? keysHint
+                       : confirmRight     ? L"↑↓ Select      ←→ Change      Enter / Ⓑ Confirm      Esc / Ⓐ Back"
+                                          : L"↑↓ Select      ←→ Change      Enter / Ⓐ Confirm      Esc / Ⓑ Back";
+    const float ky = panel.bottom - lhSmall * 1.45f - (retro ? H * 0.04f : 0.0f);
+    text(keys, rectF(tx, ky, panel.right - pad, ky + lhSmall), fit(keys, sizeSmall, false, inner), false, rgb(L.keys, a));
+  }
 }
 
 // A tap: the close button backs out; a row is chosen and used (a slider
@@ -959,5 +1121,7 @@ void Menu::drag(float dy) {
   MenuPage* p = top();
   if (!p || dy == 0) return;
   p->freeScroll = true;
-  p->scroll = std::max(0.0f, std::min(p->scroll - dy / std::max(rowH_, 1.0f), (float)std::max(0, (int)p->items.size() - 1)));
+  const std::vector<float> tops = rowTops(*p);
+  const float maxScroll = std::max(0.0f, tops.back() - std::max(1.0f, listRect_.bottom - listRect_.top));
+  p->scroll = std::clamp(p->scroll - dy, 0.0f, maxScroll);
 }

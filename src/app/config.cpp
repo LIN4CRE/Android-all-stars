@@ -18,14 +18,20 @@ enum {
 
 static const char* kActionNames[kActCount] = {
     "Up", "Down", "Left", "Right", "A", "B", "X", "Y", "L", "R", "Start", "Select",
-    "Menu", "Save State", "Load State", "Fast Forward", "Fullscreen", "Screenshot", "Rewind",
+    "Menu", "Save State", "Load State", "Fast Forward", "Screenshot", "Rewind",
 };
 static const char* kActionKeys[kActCount] = {
     "up", "down", "left", "right", "a", "b", "x", "y", "l", "r", "start", "select",
-    "menu", "savestate", "loadstate", "fastforward", "fullscreen", "screenshot", "rewind",
+    "menu", "savestate", "loadstate", "fastforward", "screenshot", "rewind",
 };
 
 const char* actionName(int a) { return (a >= 0 && a < kActCount) ? kActionNames[a] : "?"; }
+
+static const char* kTouchKeys[kTouchGroupCount] = {"dpad", "face", "l", "r", "select", "start", "menu", "ff", "rewind"};
+static const char* kTouchNames[kTouchGroupCount] = {"D-pad", "A B X Y", "L", "R", "Select", "Start", "Menu",
+                                                    "Fast Forward", "Rewind"};
+const char* touchGroupKey(int g) { return g >= 0 && g < kTouchGroupCount ? kTouchKeys[g] : "?"; }
+const char* touchGroupName(int g) { return g >= 0 && g < kTouchGroupCount ? kTouchNames[g] : "?"; }
 
 static std::string keyName(int vk) {
   switch (vk) {
@@ -121,7 +127,6 @@ void Config::setDefaults() {
   keys[0][kActSaveState] = K(VK_F5);
   keys[0][kActLoadState] = K(VK_F8);
   keys[0][kActFastForward] = K(VK_TAB);
-  keys[0][kActFullscreen] = K(VK_F11);
   keys[0][kActScreenshot] = K(VK_F12);
   keys[0][kActRewind] = K(VK_BACK);
   // Player 2 keyboard
@@ -172,17 +177,25 @@ std::string encodeBinding(const Binding& b) {
     default: return "none";
   }
 }
+// "btn:3" and the like. Anything else, or a code that no key, button, axis or
+// hat direction has, is no binding at all.
 Binding decodeBinding(const std::string& s) {
   Binding b;
   size_t c = s.find(':');
   if (c == std::string::npos) return b;
-  std::string t = s.substr(0, c);
-  int v = atoi(s.c_str() + c + 1);
-  if (t == "key") b.type = Binding::Key;
-  else if (t == "btn") b.type = Binding::PadButton;
-  else if (t == "axis+") b.type = Binding::PadAxisPos;
-  else if (t == "axis-") b.type = Binding::PadAxisNeg;
-  else if (t == "hat") b.type = Binding::PadHat;
+  const std::string t = s.substr(0, c);
+  char* end = nullptr;
+  const long v = strtol(s.c_str() + c + 1, &end, 10);
+  if (end == s.c_str() + c + 1 || *end != 0) return b;
+  Binding::Type type = Binding::None;
+  long limit = 0;
+  if (t == "key") type = Binding::Key, limit = kBindKeyCodes;
+  else if (t == "btn") type = Binding::PadButton, limit = kBindPadButtons;
+  else if (t == "axis+") type = Binding::PadAxisPos, limit = kBindPadAxes;
+  else if (t == "axis-") type = Binding::PadAxisNeg, limit = kBindPadAxes;
+  else if (t == "hat") type = Binding::PadHat, limit = kBindHatDirs;
+  if (type == Binding::None || v < 0 || v >= limit || (type == Binding::Key && v == 0)) return b;
+  b.type = type;
   b.code = (uint16_t)v;
   return b;
 }
@@ -220,25 +233,13 @@ bool Config::load(const std::wstring& path) {
     auto it = kv.find(k);
     if (it != kv.end()) out = atoi(it->second.c_str()) != 0;
   };
-  int dm = (int)displayMode;
-  geti("display.mode", dm, 0, 2);
-  displayMode = (DisplayMode)dm;
-  if (kv.count("display.monitor")) monitor = widen(kv["display.monitor"]);
-  geti("display.window_scale", windowScale, 1, 10);
   geti("display.aspect", aspect, 0, kAspectCount - 1);
+  getb("display.touch_picture_4x3", touchPicture4x3);
   getb("display.crt_pixel_aspect", pixelAspectCrt);
   geti("display.scaling", scaling, 0, 2);
-  getb("display.vsync", vsync);
-  if (kv.count("display.sync")) vsync = atoi(kv["display.sync"].c_str()) == 0;  // older builds
   getb("display.show_fps", showFps);
-  getb("display.black_frames", blackFrames);
-  getb("display.high_frame_rate", highFrameRate);
-  getb("display.pacing_log", pacingLog);
-  geti("launcher.last_game", lastGame, 0, 3);
-  getb("launcher.allstars_only", launcherAllStars);
-  getb("launcher.covers", launcherCovers);
-  getb("launcher.background", launcherBackground);
-  getb("launcher.cover_fill", launcherCoverFill);
+  getb("display.screen_60hz", screen60);
+  geti("app.last_game", lastGame, 0, 4);
   getb("display.hud_anchor", hudAnchor);
   getb("display.dim_wrap", dimWrap);
   geti("display.pillarbox", pillarbox, 0, 2);
@@ -248,7 +249,6 @@ bool Config::load(const std::wstring& path) {
   geti("graphics.filter", filter, 0, kFilterCount - 1);
   geti("graphics.scanlines", scanlines, 0, 100);
   geti("graphics.crt_curve", crtCurve, 0, 100);
-  if (kv.count("graphics.slang_preset")) slangPreset = widen(kv["graphics.slang_preset"]);
   getb("graphics.no_sprite_limit", noSpriteLimit);
   geti("color.profile", colorProfile, 0, kColorCount - 1);
   geti("color.brightness", brightness, 50, 150);
@@ -260,21 +260,40 @@ bool Config::load(const std::wstring& path) {
   geti("color.player_palette", playerPalette, 0, 15);
   geti("color.luigi_palette", luigiPalette, 0, 15);
   geti("audio.volume", volume, 0, 100);
-  getb("audio.mute_unfocused", muteUnfocused);
   geti("audio.latency", audioLatency, 20, 200);
   geti("audio.music_volume", musicVolume, 0, 100);
   geti("audio.sfx_volume", sfxVolume, 0, 100);
-  if (kv.count("audio.msu_pack")) msuPack = widen(kv["audio.msu_pack"]);
+  if (kv.count("audio.msu_pack")) {
+    // (a folder's name inside the msu folder, never a path to somewhere else)
+    const std::string& name = kv["audio.msu_pack"];
+    const bool plain = name.find('/') == std::string::npos && name.find('\\') == std::string::npos && name != "." &&
+                       name != ".." && name.size() <= 200;
+    if (plain) msuPack = widen(name);
+  }
   geti("audio.msu_volume", msuVolume, 0, 100);
   geti("input.select_button", selectMode, 0, 1);
   getb("input.menu_confirm_right", confirmRight);
   geti("interface.menu_style", menuStyle, 0, 3);
-  getb("updates.check", checkUpdates);
-  if (kv.count("updates.checked_on")) updateCheckedOn = kv["updates.checked_on"];
-  if (kv.count("updates.latest")) updateLatest = kv["updates.latest"];
   geti("input.deadzone", deadzone, 5, 90);
   geti("input.touch_mode", touchMode, 0, 2);
   geti("input.touch_opacity", touchOpacity, 10, 100);
+  geti("input.touch_scale", touchScale, kTouchScaleMin, kTouchScaleMax);
+  getb("input.touch_haptics", touchHaptics);
+  for (int g = 0; g < kTouchGroupCount; g++) {
+    auto it = kv.find(std::string("touch_layout.") + kTouchKeys[g]);
+    if (it == kv.end()) continue;
+    int x = 0, y = 0;
+    if (sscanf(it->second.c_str(), "%d,%d", &x, &y) != 2) continue;
+    if (x < -kTouchOffsetMax || x > kTouchOffsetMax || y < -kTouchOffsetMax || y > kTouchOffsetMax) continue;
+    touchOffset[g][0] = x;
+    touchOffset[g][1] = y;
+  }
+  getb("app.pause_on_return", pauseOnReturn);
+  getb("app.auto_resume", autoResume);
+  if (kv.count("app.last_backup")) {
+    const long long t = atoll(kv["app.last_backup"].c_str());
+    if (t > 0) lastBackup = t;
+  }
   getb("input.rewind", rewind);
   getb("input.fast_forward", fastForward);
   getb("achievements.on", achievements);
@@ -294,19 +313,14 @@ bool Config::load(const std::wstring& path) {
 
 bool Config::save(const std::wstring& path) const {
   std::ostringstream f;
-  f << "; Super Mario All-Stars PC port settings\n";
+  f << "; SMAS Mobile settings\n";
   f << "[display]\n";
-  f << "mode=" << (int)displayMode << "\n";
-  f << "monitor=" << narrow(monitor) << "\n";
-  f << "window_scale=" << windowScale << "\n";
   f << "aspect=" << aspect << "\n";
+  f << "touch_picture_4x3=" << touchPicture4x3 << "\n";
   f << "crt_pixel_aspect=" << pixelAspectCrt << "\n";
   f << "scaling=" << scaling << "\n";
-  f << "vsync=" << vsync << "\n";
   f << "show_fps=" << showFps << "\n";
-  f << "black_frames=" << blackFrames << "\n";
-  f << "high_frame_rate=" << highFrameRate << "\n";
-  if (pacingLog) f << "pacing_log=1\n";
+  f << "screen_60hz=" << screen60 << "\n";
   f << "hud_anchor=" << hudAnchor << "\n";
   f << "dim_wrap=" << dimWrap << "\n";
   f << "pillarbox=" << pillarbox << "\n";
@@ -314,17 +328,10 @@ bool Config::save(const std::wstring& path) const {
   f << "[game]\n";
   f << "coop=" << coop << "\n";
   f << "nes_brick_bounce=" << nesBrickBounce << "\n";
-  f << "[launcher]\n";
-  f << "last_game=" << lastGame << "\n";
-  f << "allstars_only=" << launcherAllStars << "\n";
-  f << "covers=" << launcherCovers << "\n";
-  f << "background=" << launcherBackground << "\n";
-  f << "cover_fill=" << launcherCoverFill << "\n";
   f << "[graphics]\n";
   f << "filter=" << filter << "\n";
   f << "scanlines=" << scanlines << "\n";
   f << "crt_curve=" << crtCurve << "\n";
-  f << "slang_preset=" << narrow(slangPreset) << "\n";
   f << "no_sprite_limit=" << noSpriteLimit << "\n";
   f << "[color]\n";
   f << "profile=" << colorProfile << "\n";
@@ -338,16 +345,16 @@ bool Config::save(const std::wstring& path) const {
   f << "luigi_palette=" << luigiPalette << "\n";
   f << "[audio]\n";
   f << "volume=" << volume << "\n";
-  f << "mute_unfocused=" << muteUnfocused << "\n";
   f << "latency=" << audioLatency << "\n";
   f << "music_volume=" << musicVolume << "\n";
   f << "sfx_volume=" << sfxVolume << "\n";
   f << "msu_pack=" << narrow(msuPack) << "\n";
   f << "msu_volume=" << msuVolume << "\n";
-  f << "[updates]\n";
-  f << "check=" << checkUpdates << "\n";
-  f << "checked_on=" << updateCheckedOn << "\n";
-  f << "latest=" << updateLatest << "\n";
+  f << "[app]\n";
+  f << "last_game=" << lastGame << "\n";
+  f << "pause_on_return=" << pauseOnReturn << "\n";
+  f << "auto_resume=" << autoResume << "\n";
+  f << "last_backup=" << lastBackup << "\n";
   f << "[interface]\n";
   f << "menu_style=" << menuStyle << "\n";
   f << "[input]\n";
@@ -356,6 +363,8 @@ bool Config::save(const std::wstring& path) const {
   f << "deadzone=" << deadzone << "\n";
   f << "touch_mode=" << touchMode << "\n";
   f << "touch_opacity=" << touchOpacity << "\n";
+  f << "touch_scale=" << touchScale << "\n";
+  f << "touch_haptics=" << touchHaptics << "\n";
   f << "rewind=" << rewind << "\n";
   f << "fast_forward=" << fastForward << "\n";
   f << "p1_pad=" << padIndex[0] << "\n";
@@ -366,6 +375,9 @@ bool Config::save(const std::wstring& path) const {
     f << "[p" << (p + 1) << "_pad]\n";
     for (int a = 0; a < kActCount; a++) f << kActionKeys[a] << "=" << encodeBinding(pad[p][a]) << "\n";
   }
+  f << "[touch_layout]\n";
+  for (int g = 0; g < kTouchGroupCount; g++)
+    f << kTouchKeys[g] << "=" << touchOffset[g][0] << "," << touchOffset[g][1] << "\n";
   f << "[achievements]\non=" << achievements << "\n";
   char buf[32];
   snprintf(buf, sizeof buf, "%llx", (unsigned long long)cheats);

@@ -2,6 +2,7 @@
 #include "app/imageload.h"
 #include <algorithm>
 #include "app/sys.h"
+#include "core/zipfile.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -50,4 +51,10 @@ bool loadImageFile(const std::wstring& path, int maxSide, std::vector<uint32_t>&
   *w = dw;
   *h = dh;
   return true;
+}
+
+// (stb_image's zlib decoder, for deflated entries of a backup zip: see core/zipfile.h)
+bool inflateRaw(const uint8_t* in, size_t inLen, uint8_t* out, size_t outLen) {
+  if (inLen > 0x7fffffffu || outLen > 0x7fffffffu) return false;
+  return stbi_zlib_decode_noheader_buffer((char*)out, (int)outLen, (const char*)in, (int)inLen) == (int)outLen;
 }

@@ -8,10 +8,6 @@ constexpr size_t kChunk = 4096;  // (samples read at a time)
 
 // (the core's own: the app's openFile isn't linked into smastool)
 FILE* openFile(const std::wstring& path, const char* mode) {
-#ifdef _WIN32
-  std::wstring m(mode, mode + std::strlen(mode));
-  return _wfopen(path.c_str(), m.c_str());
-#else
   std::string u;
   for (wchar_t wc : path) {
     uint32_t c = (uint32_t)wc;
@@ -23,7 +19,6 @@ FILE* openFile(const std::wstring& path, const char* mode) {
           u += (char)(0x80 | (c & 0x3f));
   }
   return fopen(u.c_str(), mode);
-#endif
 }
 
 void put32(std::vector<uint8_t>& o, uint64_t v, int bytes) {
