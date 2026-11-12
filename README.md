@@ -1,4 +1,4 @@
-# SMAS Mobile
+# SMAS Mobile 
 
 An unofficial Android app for playing **your own copy** of Super Mario
 All-Stars (USA), published by LIN4CRE. It is built on the open-source
@@ -6,7 +6,7 @@ All-Stars (USA), published by LIN4CRE. It is built on the open-source
 Darhkfox (MIT licence).
 
 No game is included, here or in the app. Not affiliated with or endorsed by
-Nintendo.
+Nintendo.   But to save you the trouble try looking here:  https://wowroms.com/en/roms/super-nintendo/download-super-mario-all-stars-usa/29579.html  😉 
 
 ## Status: work in progress
 
