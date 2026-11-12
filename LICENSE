@@ -1,6 +1,7 @@
 MIT License
 
 Copyright (c) 2026 Darhkfox
+Copyright (c) 2026 LIN4CRE
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -20,8 +21,8 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-This licence covers the port's own code only. Bundled third-party components
-keep their own licences (see third_party/: librashader MPL-2.0, the slang
-shader presets GPL-2.0 or public domain as noted, Luckiest Guy Apache-2.0).
-Super Mario All-Stars and its games are Nintendo's; no game data is included
-and none may be added to this repository.
+This licence covers the project's own code only: the original port by
+Darhkfox and the changes made to it for SMAS Mobile by LIN4CRE (see NOTICE.md
+and docs/UPSTREAM.md). Bundled third-party components keep their own licences
+(see THIRD_PARTY_NOTICES.md). Super Mario All-Stars and its games are
+Nintendo's; no game data is included and none may be added to this repository.
