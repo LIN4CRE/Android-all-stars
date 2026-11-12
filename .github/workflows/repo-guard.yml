@@ -1,0 +1,58 @@
+# Repository guard: no game data, no saves, no signing keys, no secrets.
+# Runs on every pull request and on every push to main.
+name: Repo guard
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repo-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: No ROMs, saves, keys or secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check the tracked tree
+        run: python3 tools/repo_guard.py
+      - name: Check every commit of this change
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # A file added in one commit and removed in a later one is still published history.
+          status=0
+          for c in $(git rev-list "$BASE..$HEAD"); do
+            bad=$(git diff-tree --no-commit-id --name-only -r --diff-filter=ACMR "$c" \
+                  | grep -i -E '\.(sfc|smc|swc|fig|srm|sst|state|jks|keystore|p12|pfx|pem|pk8|apk|aab)$' || true)
+            if [ -n "$bad" ]; then
+              echo "::error::commit $c adds forbidden file(s): $(echo $bad | tr '\n' ' ')"
+              status=1
+            fi
+          done
+          exit $status
+      - name: Runner facts (build environment record)
+        run: |
+          {
+            echo "kvm=$( [ -e /dev/kvm ] && echo present || echo absent )"
+            echo "java=$(java -version 2>&1 | head -1)"
+            echo "sdk=$ANDROID_HOME"
+            echo "ndk=$(ls "$ANDROID_HOME/ndk" | tr '\n' ' ')"
+            echo "cmake=$(ls "$ANDROID_HOME/cmake" | tr '\n' ' ')"
+            echo "platforms=$(ls "$ANDROID_HOME/platforms" | tr '\n' ' ')"
+            echo "build-tools=$(ls "$ANDROID_HOME/build-tools" | tr '\n' ' ')"
+            echo "cpus=$(nproc) mem=$(free -g | awk '/Mem:/{print $2}')G"
+          } | tee facts.txt
+          echo "::notice title=Runner facts::$(tr '\n' ';' < facts.txt)"
